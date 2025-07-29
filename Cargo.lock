@@ -1509,6 +1509,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "compat"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1993b0854368a452b0011692f128362d9b42dbe17e009b1b4dd10e91ede39c27"
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2453,6 +2459,12 @@ checksum = "a296e5a895621edf9fa8329c83aa1cb69a964643e36cf54d8d7a69b789089537"
 dependencies = [
  "ext-trait",
 ]
+
+[[package]]
+name = "f"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39c9599da4f7bbd19df30c2a4df53a809d86397f489a3352c30ba8cbc58f5ff8"
 
 [[package]]
 name = "fast-async-mutex"
@@ -3796,7 +3808,9 @@ dependencies = [
  "async-trait",
  "bon",
  "bytes",
+ "compat",
  "dashmap",
+ "f",
  "flume",
  "futures",
  "futures-util",
@@ -3812,6 +3826,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tracing",
  "trait-variant",
  "webpki-roots 1.0.2",

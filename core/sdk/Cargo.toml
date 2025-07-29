@@ -40,7 +40,9 @@ async-dropper = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
+compat = "0.0.0"
 dashmap = { workspace = true }
+f = "0.0.0"
 # Can be removed if the feature above gets removed.
 #fast-async-mutex = { version = "0.6.7", optional = true }
 flume = { workspace = true }
@@ -57,6 +59,7 @@ rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-util.workspace = true
 tracing = { workspace = true }
 trait-variant = { workspace = true }
 webpki-roots = { workspace = true }
