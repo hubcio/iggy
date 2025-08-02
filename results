@@ -1,0 +1,13 @@
+original
+
+2025-07-31T05:36:07.386650Z  INFO bench_report::prints: Benchmark: Pinned Producer And Consumer, 8 producers, 8 consumers, 8 streams, 1 topic per stream, 1 partitions per topic, 6400000 messages, 200 messages per batch, 32000 message batches, 1000 bytes per message, 6.4GB of data processed
+
+2025-07-31T05:36:07.386667Z  INFO bench_report::prints: Producers Results: Total throughput: 1422.49 MB/s, 1422490 messages/s, average throughput per Producer: 177.81 MB/s, p50 latency: 0.95 ms, p90 latency: 1.74 ms, p95 latency: 2.25 ms, p99 latency: 4.45 ms, p999 latency: 11.78 ms, p9999 latency: 31.65 ms, average latency: 1.11 ms, median latency: 0.95 ms, min: 0.28 ms, max: 33.41 ms, std dev: 0.52 ms, total time: 2.25 s
+
+2025-07-31T05:36:07.386673Z  INFO bench_report::prints: Consumers Results: Total throughput: 1421.86 MB/s, 1421858 messages/s, average throughput per Consumer: 177.73 MB/s, p50 latency: 0.87 ms, p90 latency: 1.73 ms, p95 latency: 2.24 ms, p99 latency: 4.63 ms, p999 latency: 11.98 ms, p9999 latency: 32.95 ms, average latency: 1.05 ms, median latency: 0.87 ms, min: 0.28 ms, max: 40.72 ms, std dev: 0.85 ms, total time: 2.25 s
+
+2025-07-31T05:36:07.386677Z  INFO bench_report::prints: Aggregate Results: Total throughput: 2844.35 MB/s, 2844348 messages/s, average throughput per Actor: 177.77 MB/s, p50 latency: 0.91 ms, p90 latency: 1.73 ms, p95 latency: 2.24 ms, p99 latency: 4.54 ms, p999 latency: 11.88 ms, p9999 latency: 32.30 ms, average latency: 1.08 ms, median latency: 0.91 ms, min: 0.28 ms, max: 40.72 ms, std dev: 0.82 ms, total time: 2.25 s
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------

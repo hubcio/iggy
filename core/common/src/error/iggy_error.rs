@@ -467,6 +467,8 @@ pub enum IggyError {
     IoError = 10052,
     #[error("Max number of retry has exceeded")]
     MaxRetriesExceeded = 10053,
+    #[error("Connection timeout")]
+    ConnectionTimeout = 10054,
 }
 
 impl IggyError {

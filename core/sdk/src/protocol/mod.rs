@@ -42,7 +42,7 @@ pub struct ProtocolCore {
     state: ClientState,
     config: ProtocolCoreConfig,
     last_connect_attempt: Option<Instant>,
-    retry_count: u32,
+    pub retry_count: u32,
     next_request_id: u64,
     pending_sends: VecDeque<(u32, Bytes, u64)>,
     sent_order: VecDeque<u64>,
@@ -72,7 +72,7 @@ impl ProtocolCore {
     pub fn poll(&mut self) -> Order {
         match self.state {
             ClientState::Disconnected => self.handle_disconnected(),
-            ClientState::Connecting => Order::Noop,
+            ClientState::Connecting => Order::Connect,
             ClientState::Connected => self.handle_connected(),
             ClientState::Authenticating => Order::Noop,
             ClientState::Authenticated => self.poll_transmit(),

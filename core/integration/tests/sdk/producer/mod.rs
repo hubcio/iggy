@@ -18,9 +18,14 @@
 
 mod background;
 
+use std::{sync::Arc, time::Duration};
+
 use bytes::Bytes;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
+use integration::test_server::{login_root, TestServer};
+use iggy::connection::{TokioTcpTransport, NewTcpClient, TokioRuntime};
+use tokio::time::sleep;
 
 const STREAM_ID: u32 = 1;
 const TOPIC_ID: u32 = 1;
@@ -61,4 +66,75 @@ async fn cleanup(system_client: &IggyClient) {
         .delete_stream(&Identifier::numeric(STREAM_ID).unwrap())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_async_send() {
+    let mut test_server = TestServer::default();
+    test_server.start();
+
+    let tcp_client_config = TcpClientConfig {
+        server_address: test_server.get_raw_tcp_addr().unwrap(),
+        ..TcpClientConfig::default()
+    };
+
+    // let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    // let client = IggyClient::create(client, None, None);
+
+    let tcp_client = NewTcpClient::create(Arc::new(tcp_client_config)).unwrap();
+
+    let client = IggyClient::create(iggy::prelude::ClientWrapper::New(tcp_client), None, None);
+
+    client.connect().await.unwrap();
+    sleep(Duration::from_secs(5)).await;
+    assert!(client.ping().await.is_ok(), "Failed to ping server");
+
+    login_root(&client).await;
+    init_system(&client).await;
+
+    client.connect().await.unwrap();
+    assert!(client.ping().await.is_ok(), "Failed to ping server");
+
+    let messages_count = 1000;
+
+    let mut messages = Vec::new();
+    for offset in 0..messages_count {
+        let id = (offset + 1) as u128;
+        let payload = create_message_payload(offset as u64);
+        messages.push(
+            IggyMessage::builder()
+                .id(id)
+                .payload(payload)
+                .build()
+                .expect("Failed to create message with headers"),
+        );
+    }
+
+    let producer = client
+        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+        .unwrap()
+        .partitioning(Partitioning::partition_id(PARTITION_ID))
+        .background(BackgroundConfig::builder().build())
+        .build();
+
+    producer.send(messages).await.unwrap();
+    sleep(Duration::from_millis(500)).await;
+    producer.shutdown().await;
+
+    let consumer = Consumer::default();
+    let polled_messages = client
+        .poll_messages(
+            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::numeric(TOPIC_ID).unwrap(),
+            Some(PARTITION_ID),
+            &consumer,
+            &PollingStrategy::offset(0),
+            messages_count,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled_messages.messages.len() as u32, messages_count);
+    cleanup(&client).await;
 }

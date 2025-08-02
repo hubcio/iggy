@@ -18,7 +18,7 @@
 
 use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
-use iggy::prelude::{Client, ClientWrapper, TcpClient, TcpClientConfig};
+use iggy::{connection::NewTcpClient, prelude::{Client, ClientWrapper, IggyClient, TcpClient, TcpClientConfig}};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -43,13 +43,20 @@ impl ClientFactory for TcpClientFactory {
             tls_validate_certificate: self.tls_validate_certificate,
             ..TcpClientConfig::default()
         };
-        let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
-            panic!(
-                "Failed to create TcpClient, iggy-server has address {}, error: {:?}",
-                self.server_addr, e
-            )
-        });
-        Client::connect(&client).await.unwrap_or_else(|e| {
+
+        let tcp_client = NewTcpClient::create(Arc::new(config)).unwrap();
+        let wrapper = ClientWrapper::New(tcp_client);
+
+        // let client = IggyClient::create(iggy::prelude::ClientWrapper::New(tcp_client), None, None);
+
+        // let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
+        //     panic!(
+        //         "Failed to create TcpClient, iggy-server has address {}, error: {:?}",
+        //         self.server_addr, e
+        //     )
+        // });
+
+        Client::connect(&wrapper).await.unwrap_or_else(|e| {
             if self.tls_enabled {
                 panic!(
                     "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
@@ -65,7 +72,7 @@ impl ClientFactory for TcpClientFactory {
                 )
             }
         });
-        ClientWrapper::Tcp(client)
+        wrapper
     }
 
     fn transport(&self) -> Transport {
