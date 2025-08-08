@@ -1,9 +1,17 @@
 use iggy_common::Identifier;
 use slab::Slab;
-use std::{cell::{Ref, RefCell, RefMut}, ops::Deref, sync::Arc};
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    ops::Deref,
+    sync::Arc,
+};
 
 use crate::{
-    slab::{partitions::Partitions, traits::{Access, AccessMut, Decompose, ProjectCell, ProjectCellMut}, IndexedSlab, Keyed},
+    slab::{
+        IndexedSlab, Keyed,
+        partitions::Partitions,
+        traits::{Access, AccessMut, Decompose, ProjectCell, ProjectCellMut},
+    },
     streaming::{partitions::partition2, stats::stats::TopicStats, topics::topic2},
 };
 
@@ -20,7 +28,8 @@ pub struct TopicRef<'topics> {
 }
 
 impl ProjectCell for Topics {
-    type View<'me> = TopicRef<'me>
+    type View<'me>
+        = TopicRef<'me>
     where
         Self: 'me;
 
@@ -44,7 +53,8 @@ impl<'topics> Decompose for TopicRefMut<'topics> {
 }
 
 impl ProjectCellMut for Topics {
-    type ViewMut<'me> = TopicRefMut<'me>
+    type ViewMut<'me>
+        = TopicRefMut<'me>
     where
         Self: 'me;
 

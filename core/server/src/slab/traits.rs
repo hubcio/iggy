@@ -1,20 +1,28 @@
 pub trait ProjectCell {
-    type View<'me>: where Self: 'me;
+    type View<'me>
+    where
+        Self: 'me;
     fn project(&self) -> Self::View<'_>;
 }
 
 pub trait ProjectCellMut {
-    type ViewMut<'me>: where Self: 'me;
+    type ViewMut<'me>
+    where
+        Self: 'me;
     fn project_mut(&self) -> Self::ViewMut<'_>;
 }
 
 pub trait Project {
-    type View<'me>: where Self: 'me;
+    type View<'me>
+    where
+        Self: 'me;
     fn project(&self) -> Self::View<'_>;
 }
 
 pub trait ProjectMut {
-    type ViewMut<'me>: where Self: 'me;
+    type ViewMut<'me>
+    where
+        Self: 'me;
     fn project_mut(&mut self) -> Self::ViewMut<'_>;
 }
 
@@ -75,7 +83,7 @@ where
     }
 }
 
-impl <'slab, Slab, RefMut> AccessMut<RefMut, NonCell> for &'slab mut Slab
+impl<'slab, Slab, RefMut> AccessMut<RefMut, NonCell> for &'slab mut Slab
 where
     RefMut: Decompose,
     Slab: ProjectMut<ViewMut<'slab> = RefMut>,
@@ -108,7 +116,7 @@ where
     }
 }
 
-impl <'slab, Slab, RefMut> AccessMut<RefMut, Cell> for &'slab Slab
+impl<'slab, Slab, RefMut> AccessMut<RefMut, Cell> for &'slab Slab
 where
     RefMut: Decompose,
     Slab: ProjectCellMut<ViewMut<'slab> = RefMut>,

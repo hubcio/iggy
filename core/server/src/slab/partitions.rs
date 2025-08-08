@@ -1,10 +1,13 @@
-use crate::{slab::traits::{Decompose, Project, ProjectMut}, streaming::{
-    deduplication::message_deduplicator::MessageDeduplicator, partitions::partition2, segments,
-    stats::stats::PartitionStats,
-}};
+use crate::slab::traits::{Access, AccessMut};
+use crate::{
+    slab::traits::{Decompose, Project, ProjectMut},
+    streaming::{
+        deduplication::message_deduplicator::MessageDeduplicator, partitions::partition2, segments,
+        stats::stats::PartitionStats,
+    },
+};
 use slab::Slab;
 use std::sync::{Arc, atomic::AtomicU64};
-use crate::slab::traits::{Access, AccessMut};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 pub const PARTITIONS_CAPACITY: usize = 16384;
@@ -31,19 +34,20 @@ impl Default for Partitions {
 }
 
 pub struct PartitionRef<'partitions> {
-    partition: &'partitions Slab<partition2::Partition>,    
+    partition: &'partitions Slab<partition2::Partition>,
 }
 
 impl<'partitions> Decompose for PartitionRef<'partitions> {
     type Target = &'partitions Slab<partition2::Partition>;
-    
+
     fn decompose(self) -> Self::Target {
         self.partition
     }
 }
 
 impl Project for Partitions {
-    type View<'me> = PartitionRef<'me>
+    type View<'me>
+        = PartitionRef<'me>
     where
         Self: 'me;
 
@@ -60,14 +64,15 @@ pub struct PartitionRefMut<'partitions> {
 
 impl<'partitions> Decompose for PartitionRefMut<'partitions> {
     type Target = &'partitions mut Slab<partition2::Partition>;
-    
+
     fn decompose(self) -> Self::Target {
         self.partition
     }
 }
 
 impl ProjectMut for Partitions {
-    type ViewMut<'me> = PartitionRefMut<'me>
+    type ViewMut<'me>
+        = PartitionRefMut<'me>
     where
         Self: 'me;
 
