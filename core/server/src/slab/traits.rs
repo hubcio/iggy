@@ -41,9 +41,9 @@ where
     where
         F: FnOnce(Ref::Target) -> T;
 
-    fn with_async<T, F>(self, f: F) -> T
+    async fn with_async<T, F>(self, f: F) -> T
     where
-        F: FnOnce(Ref::Target) -> T;
+        F: AsyncFnOnce(Ref::Target) -> T;
 }
 
 pub trait AccessMut<RefMut, Marker>
@@ -67,11 +67,11 @@ where
         f(self.project().decompose())
     }
 
-    fn with_async<T, F>(self, f: F) -> T
+    async fn with_async<T, F>(self, f: F) -> T
     where
-        F: FnOnce(Ref::Target) -> T,
+        F: AsyncFnOnce(Ref::Target) -> T,
     {
-        f(self.project().decompose())
+        f(self.project().decompose()).await
     }
 }
 
@@ -100,11 +100,11 @@ where
         f(self.project().decompose())
     }
 
-    fn with_async<T, F>(self, f: F) -> T
+    async fn with_async<T, F>(self, f: F) -> T
     where
-        F: FnOnce(Ref::Target) -> T,
+        F: AsyncFnOnce(Ref::Target) -> T,
     {
-        f(self.project().decompose())
+        f(self.project().decompose()).await
     }
 }
 
