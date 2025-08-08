@@ -41,7 +41,7 @@ where
     where
         F: FnOnce(Ref::Target) -> T;
 
-    async fn with_async<T, F>(self, f: F) -> T
+    fn with_async<T, F>(self, f: F) -> impl Future<Output = T>
     where
         F: AsyncFnOnce(Ref::Target) -> T;
 }
