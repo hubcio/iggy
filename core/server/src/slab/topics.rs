@@ -1,9 +1,9 @@
 use iggy_common::Identifier;
 use slab::Slab;
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::{Ref, RefCell, RefMut}, ops::Deref, sync::Arc};
 
 use crate::{
-    slab::{IndexedSlab, Keyed, partitions::Partitions},
+    slab::{partitions::Partitions, traits::{Access, AccessMut, Decompose, ProjectCell, ProjectCellMut}, IndexedSlab, Keyed},
     streaming::{partitions::partition2, stats::stats::TopicStats, topics::topic2},
 };
 
@@ -13,6 +13,54 @@ const CAPACITY: usize = 1024;
 pub struct Topics {
     container: RefCell<IndexedSlab<topic2::Topic>>,
     stats: RefCell<Slab<Arc<TopicStats>>>,
+}
+
+pub struct TopicRef<'topics> {
+    topic: Ref<'topics, IndexedSlab<topic2::Topic>>,
+}
+
+impl ProjectCell for Topics {
+    type View<'me> = TopicRef<'me>
+    where
+        Self: 'me;
+
+    fn project(&self) -> Self::View<'_> {
+        TopicRef {
+            topic: self.container.borrow(),
+        }
+    }
+}
+
+pub struct TopicRefMut<'topics> {
+    topic: RefMut<'topics, IndexedSlab<topic2::Topic>>,
+}
+
+impl<'topics> Decompose for TopicRefMut<'topics> {
+    type Target = RefMut<'topics, IndexedSlab<topic2::Topic>>;
+
+    fn decompose(self) -> Self::Target {
+        self.topic
+    }
+}
+
+impl ProjectCellMut for Topics {
+    type ViewMut<'me> = TopicRefMut<'me>
+    where
+        Self: 'me;
+
+    fn project_mut(&self) -> Self::ViewMut<'_> {
+        TopicRefMut {
+            topic: self.container.borrow_mut(),
+        }
+    }
+}
+
+impl<'topics> Decompose for TopicRef<'topics> {
+    type Target = Ref<'topics, IndexedSlab<topic2::Topic>>;
+
+    fn decompose(self) -> Self::Target {
+        self.topic
+    }
 }
 
 impl Topics {
@@ -72,27 +120,12 @@ impl Topics {
         self.container.borrow().len()
     }
 
-    pub async fn with_async<T>(&self, f: impl AsyncFnOnce(&IndexedSlab<topic2::Topic>) -> T) -> T {
-        let container = self.container.borrow();
-        f(&container).await
-    }
-
-    pub fn with<T>(&self, f: impl FnOnce(&IndexedSlab<topic2::Topic>) -> T) -> T {
-        let container = self.container.borrow();
-        f(&container)
-    }
-
-    pub fn with_mut<T>(&self, f: impl FnOnce(&mut IndexedSlab<topic2::Topic>) -> T) -> T {
-        let mut container = self.container.borrow_mut();
-        f(&mut container)
-    }
-
     pub async fn with_topic_by_id_async<T>(
         &self,
         id: &Identifier,
         f: impl AsyncFnOnce(&topic2::Topic) -> T,
     ) -> T {
-        self.with_async(async |topics| Self::get_topic_ref(id, topics).invoke_async(f).await)
+        self.with_async(async |topics| Self::get_topic_ref(id, &topics).invoke_async(f).await)
             .await
     }
 
@@ -106,7 +139,7 @@ impl Topics {
     }
 
     pub fn with_topic_by_id<T>(&self, id: &Identifier, f: impl FnOnce(&topic2::Topic) -> T) -> T {
-        self.with(|topics| Self::get_topic_ref(id, topics).invoke(f))
+        self.with(|topics| Self::get_topic_ref(id, &topics).invoke(f))
     }
 
     pub fn with_topic_by_id_mut<T>(
@@ -114,7 +147,7 @@ impl Topics {
         id: &Identifier,
         f: impl FnOnce(&mut topic2::Topic) -> T,
     ) -> T {
-        self.with_mut(|topics| Self::get_topic_mut(id, topics).invoke_mut(f))
+        self.with_mut(|mut topics| Self::get_topic_mut(id, &mut topics).invoke_mut(f))
     }
 
     pub fn with_partitions(&self, topic_id: &Identifier, f: impl FnOnce(&Partitions)) {
