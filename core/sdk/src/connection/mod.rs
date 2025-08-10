@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
     io,
+    ops::Deref,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -14,7 +15,7 @@ use std::{
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
-use futures::{AsyncRead, AsyncWrite, future::poll_fn};
+use futures::{future::poll_fn, AsyncRead, AsyncWrite, FutureExt};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, Client};
 use iggy_common::{
     ClientState, Command, DiagnosticEvent, IggyDuration, IggyError, TcpClientConfig,
@@ -35,6 +36,12 @@ pub struct ConnectionStats {
     pub bytes_received: u64,
     pub pending_sends: usize,
     pub pending_receives: usize,
+}
+
+pub enum ClientCommand<S: AsyncIO> {
+    Connect((tokio::sync::oneshot::Sender<()>, Pin<Box<S>>)),
+    Disconnect(tokio::sync::oneshot::Sender<()>),
+    Shutdown(tokio::sync::oneshot::Sender<()>),
 }
 
 pub trait AsyncIO: AsyncWrite + AsyncRead + Unpin {}
@@ -60,107 +67,106 @@ struct SendState {
     offset: usize,
 }
 
+// sans-io state, который будет находиться отдкельно
 #[derive(Debug)]
-pub struct ConnectionState {
-    core: ProtocolCore,
-    pub recv_waiters: HashMap<u64, Waker>,
-    ready_responses: HashMap<u64, Result<Bytes, IggyError>>,
+pub struct ProtoConnectionState {
+    pub core: ProtocolCore,
     driver: Option<Waker>,
     error: Option<IggyError>,
-    pending_orders: VecDeque<Order>,
 }
 
-struct ConnectionDriver<S> {
-    state: Arc<Mutex<ConnectionState>>,
+pub struct ConnectionInner<S: AsyncIO> {
+    pub(crate) state: Mutex<State<S>>,
+}
+
+pub struct ConnectionRef<S>(Arc<ConnectionInner<S>>);
+
+impl<S> Deref for ConnectionRef<S> {
+    type Target = ConnectionInner<S>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct State<S: AsyncIO> {
+    inner: ProtoConnectionState,
+    driver: Option<Waker>,
     socket: Pin<Box<S>>,
     current_send: Option<TxBuf>,
     send_offset: usize,
     recv_buffer: BytesMut,
     wait_timer: Option<Pin<Box<Sleep>>>,
+    send_buf: Mutex<VecDeque<(u32, Bytes)>>,
+    ready_responses: HashMap<u64, Result<Bytes, IggyError>>,
+    pub recv_waiters: HashMap<u64, Waker>,
+    client_commands_rx: flume::Receiver<ClientCommand<S>>,
+    config: Arc<TcpClientConfig>,
 }
 
-impl<S: AsyncIO + Send> ConnectionDriver<S> {
-    fn new(state: Arc<Mutex<ConnectionState>>, socket: S) -> Self {
-        Self {
-            state,
-            socket: Box::pin(socket),
-            current_send: None,
-            send_offset: 0,
-            recv_buffer: BytesMut::with_capacity(4096),
-            wait_timer: None,
+impl<S: AsyncIO> State<S> {
+    fn drive_client_commands(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let fut = self.client_commands_rx.recv_async();
+        loop {
+            match Pin::new(&mut fut).poll(cx) {
+                Poll::Pending => return Ok(false),
+                Poll::Ready(Ok(cmd)) => {
+                    match cmd {
+                        ClientCommand::Connect((tx, socket)) => {
+                            // TODO add core.poll
+                            self.socket = socket;
+                            tx.send(());
+                        },
+                        _ => {todo!("обработать")}
+                    }
+                }
+                Poll::Ready(Err(e)) => return Err(e)
+            }
         }
     }
-}
 
-impl<S: AsyncIO> Future for ConnectionDriver<S> {
-    type Output = Result<(), io::Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        {
-            let mut st = self.state.lock().unwrap();
-            st.driver = Some(cx.waker().clone());
-        }
-
-        let mut recv_scratch = vec![0u8; 4096];
+    fn drive_timer(&mut self, cx: &mut Context<'_>) -> bool {
         if let Some(t) = &mut self.wait_timer {
             if t.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
+                return false;
             }
             self.wait_timer = None;
         }
+        true
+    }
 
-        let order = {
-            let mut st = self.state.lock().unwrap();
-            st.core.poll()
-        };
-
-        match order {
-            Order::Wait(dur) => {
-                self.wait_timer = Some(Box::pin(tokio::time::sleep(dur.get_duration())));
-                return Poll::Pending;
-            }
-            Order::Transmit(tx) => {
-                self.current_send = Some(tx);
-                self.send_offset = 0;
-            }
-            Order::Error(e) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))));
-            }
-            Order::Noop | Order::Authenticate { .. } => {}
-            Order::Connect => unreachable!("handled in Transport"),
-        }
-
+    fn drive_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         let mut offset = self.send_offset;
-        // TODO запихать обратно в случае неудачи
         if let Some(buf) = self.current_send.take() {
             while self.send_offset < buf.data.len() {
-                let n = ready!(
-                    self.socket
-                        .as_mut()
-                        .poll_write(cx, &buf.data[offset..])
-                )?;
-                offset += n;
+                match self.socket.as_mut().poll_write(cx, &buf.data[offset..])? {
+                    Poll::Ready(n) => {
+                        offset += n;
+                    }
+                    Poll::Pending => return Ok(false),
+                }
             }
-            ready!(self.socket.as_mut().poll_flush(cx))?;
+            match self.socket.as_mut().poll_flush(cx)? {
+                Poll::Pending => return Ok(false),
+                Poll::Ready(n_) => {}
+            }
             self.current_send = None;
         }
+        Ok(true)
+    }
 
+    fn drive_receive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let mut recv_scratch = vec![0u8; 4096];
         loop {
-            let n = match self.socket.as_mut().poll_read(cx, &mut recv_scratch) {
-                Poll::Pending => break,
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into())),
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            let n = match self.socket.as_mut().poll_read(cx, &mut recv_scratch)? {
+                Poll::Pending => return Ok(false),
+                Poll::Ready(n) => n,
             };
             self.recv_buffer.extend_from_slice(&recv_scratch[..n]);
             self.process_incoming()?;
         }
-
-        Poll::Pending
     }
-}
 
-impl<S: AsyncIO> ConnectionDriver<S> {
+    // TODO перенкести в sans io ядро
     fn process_incoming(&mut self) -> Result<(), io::Error> {
         loop {
             if self.recv_buffer.len() < 8 {
@@ -180,15 +186,14 @@ impl<S: AsyncIO> ConnectionDriver<S> {
                 Bytes::new()
             };
 
-            let mut state = self.state.lock().unwrap();
-            if let Some(request_id) = state.core.on_response(status, &payload) {
+            if let Some(request_id) = self.inner.core.on_response(status, &payload) {
                 let result = if status == 0 {
                     Ok(payload)
                 } else {
                     Err(IggyError::from_code(status))
                 };
-                state.ready_responses.insert(request_id, result);
-                if let Some(waker) = state.recv_waiters.remove(&request_id) {
+                self.ready_responses.insert(request_id, result);
+                if let Some(waker) = self.recv_waiters.remove(&request_id) {
                     waker.wake();
                 }
             }
@@ -197,9 +202,65 @@ impl<S: AsyncIO> ConnectionDriver<S> {
     }
 }
 
+struct ConnectionDriver<S>(ConnectionRef<S>);
+
+impl<S: AsyncIO + Send> ConnectionDriver<S> {
+    // fn new(state: Arc<Mutex<ProtoConnectionState>>, socket: S) -> Self {
+    //     Self {
+    //         state,
+    //         socket: Box::pin(socket),
+    //         current_send: None,
+    //         send_offset: 0,
+    //         recv_buffer: BytesMut::with_capacity(4096),
+    //         wait_timer: None,
+    //         send_buf: Mutex::new(VecDeque::new())
+    //     }
+    // }
+}
+
+impl<S: AsyncIO> Future for ConnectionDriver<S> {
+    type Output = Result<(), io::Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let st = &mut *self.0.state.lock().unwrap();
+
+        let mut keep_going = st.drive_timer(cx);
+
+        let order = st.inner.core.poll();
+
+        match order {
+            Order::Wait(dur) => {
+                st.wait_timer = Some(Box::pin(tokio::time::sleep(dur.get_duration())));
+                return Poll::Pending;
+            }
+            Order::Transmit(tx) => {
+                st.current_send = Some(tx);
+                st.send_offset = 0;
+            }
+            Order::Error(e) => {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))));
+            }
+            Order::Noop | Order::Authenticate { .. } => {}
+            Order::Connect => {todo!("добавить вызов метода из state")}
+        }
+
+        keep_going |= st.drive_client_commands(cx)?;
+        keep_going |= st.drive_transmit(cx)?;
+        keep_going |= st.drive_receive(cx)?;
+
+        if keep_going {
+            cx.waker().wake_by_ref();
+        } else {
+            st.driver = Some(cx.waker().clone());
+        }
+
+        Poll::Pending
+    }
+}
+
 #[derive(Debug)]
 pub struct TokioTcpTransport {
-    state: Arc<Mutex<ConnectionState>>,
+    state: Arc<Mutex<ProtoConnectionState>>,
     runtime: Arc<dyn Runtime>,
     config: Arc<TcpClientConfig>,
     socket_handle: Option<tokio::task::JoinHandle<()>>,
@@ -214,13 +275,12 @@ impl TokioTcpTransport {
             auto_login: config.auto_login.clone(),
         };
 
-        let state = Arc::new(Mutex::new(ConnectionState {
+        let state = Arc::new(Mutex::new(ProtoConnectionState {
             core: ProtocolCore::new(core_config),
-            recv_waiters: HashMap::new(),
-            ready_responses: HashMap::new(),
+            // recv_waiters: HashMap::new(),
+            // ready_responses: HashMap::new(),
             driver: None,
             error: None,
-            pending_orders: VecDeque::new(),
         }));
 
         Self {
@@ -232,66 +292,66 @@ impl TokioTcpTransport {
         }
     }
 
-    async fn run(&mut self) {
-        {
-            let mut state = self.state.lock().unwrap();
-            let order = state.core.poll();
-            if !matches!(order, Order::Connect | Order::Wait(_)) {
-                debug!("Initial poll returned: {:?}", order);
-            }
-        }
+    // async fn run(&mut self) {
+    //     {
+    //         let mut state = self.state.lock().unwrap();
+    //         let order = state.core.poll();
+    //         if !matches!(order, Order::Connect | Order::Wait(_)) {
+    //             debug!("Initial poll returned: {:?}", order);
+    //         }
+    //     }
 
-        while !self.shutdown.load(Ordering::Relaxed) {
-            let order = {
-                let mut state = self.state.lock().unwrap();
-                state.core.poll()
-            };
+    //     while !self.shutdown.load(Ordering::Relaxed) {
+    //         let order = {
+    //             let mut state = self.state.lock().unwrap();
+    //             state.core.poll()
+    //         };
 
-            match order {
-                Order::Connect => match TcpStream::connect(&self.config.server_address).await {
-                    Ok(socket) => {
-                        info!("Connected to {}", self.config.server_address);
+    //         match order {
+    //             Order::Connect => match TcpStream::connect(&self.config.server_address).await {
+    //                 Ok(socket) => {
+    //                     info!("Connected to {}", self.config.server_address);
 
-                        {
-                            let mut state = self.state.lock().unwrap();
-                            state.core.on_connected();
-                        }
+    //                     {
+    //                         let mut state = self.state.lock().unwrap();
+    //                         state.core.on_connected();
+    //                     }
 
-                        let socket_compat = socket.compat();
-                        let driver = ConnectionDriver::new(self.state.clone(), socket_compat);
-                        let state_clone = self.state.clone();
-                        let handle = tokio::spawn(async move {
-                            if let Err(e) = driver.await {
-                                error!("Driver error: {}", e);
-                                let mut state = state_clone.lock().unwrap();
-                                state.core.on_disconnected();
-                            }
-                        });
+    //                     let socket_compat = socket.compat();
+    //                     let driver = ConnectionDriver::new(self.state.clone(), socket_compat);
+    //                     let state_clone = self.state.clone();
+    //                     let handle = tokio::spawn(async move {
+    //                         if let Err(e) = driver.await {
+    //                             error!("Driver error: {}", e);
+    //                             let mut state = state_clone.lock().unwrap();
+    //                             state.core.on_disconnected();
+    //                         }
+    //                     });
 
-                        self.socket_handle = Some(handle);
-                    }
-                    Err(e) => {
-                        error!("Connection failed: {}", e);
-                        let mut state = self.state.lock().unwrap();
-                        state.core.on_disconnected();
-                    }
-                },
+    //                     self.socket_handle = Some(handle);
+    //                 }
+    //                 Err(e) => {
+    //                     error!("Connection failed: {}", e);
+    //                     let mut state = self.state.lock().unwrap();
+    //                     state.core.on_disconnected();
+    //                 }
+    //             },
 
-                Order::Wait(duration) => {
-                    tokio::select! {
-                        _ = sleep(duration.get_duration()) => {}
-                        _ = tokio::signal::ctrl_c() => {
-                            self.shutdown.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
+    //             Order::Wait(duration) => {
+    //                 tokio::select! {
+    //                     _ = sleep(duration.get_duration()) => {}
+    //                     _ = tokio::signal::ctrl_c() => {
+    //                         self.shutdown.store(true, Ordering::Relaxed);
+    //                     }
+    //                 }
+    //             }
 
-                _ => {
-                    sleep(Duration::from_millis(10)).await;
-                }
-            }
-        }
-    }
+    //             _ => {
+    //                 sleep(Duration::from_millis(10)).await;
+    //             }
+    //         }
+    //     }
+    // }
 
     async fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -303,21 +363,23 @@ impl TokioTcpTransport {
 }
 
 #[derive(Debug)]
-pub struct NewTcpClient {
+pub struct NewTcpClient<S: AsyncIO> {
     transport: Arc<TokioMutex<Option<TokioTcpTransport>>>,
-    state: Arc<Mutex<ConnectionState>>,
+    state: Arc<Mutex<ProtoConnectionState>>,
     config: Arc<TcpClientConfig>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
     runtime: Arc<dyn Runtime>,
+    client_command_tx: flume::Sender<ClientCommand<S>>,
 }
 
-impl NewTcpClient {
+impl<S: AsyncIO> NewTcpClient<S> {
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         let runtime = Arc::new(TokioRuntime {});
         let transport = TokioTcpTransport::new(config.clone(), runtime.clone());
         let state = transport.state.clone();
 
         let (tx, rx) = broadcast(1000);
+        let (client_tx, client_rx) = flume::unbounded::<ClientCommand>();
 
         Ok(Self {
             transport: Arc::new(TokioMutex::new(Some(transport))),
@@ -325,6 +387,7 @@ impl NewTcpClient {
             config,
             events: (tx, rx),
             runtime,
+            client_command_tx: client_tx,
         })
     }
 
@@ -361,82 +424,61 @@ impl NewTcpClient {
         .await
     }
 
-    async fn wait_for_connection(&self) -> Result<(), IggyError> {
-        poll_fn(|cx| {
-            let state = self.state.lock().unwrap();
+    // async fn wait_for_connection(&self) -> Result<(), IggyError> {
+    //     poll_fn(|cx| {
+    //         let state = self.state.lock().unwrap();
 
-            if let Some(ref error) = state.error {
-                return Poll::Ready(Err(error.clone()));
-            }
+    //         if let Some(ref error) = state.error {
+    //             return Poll::Ready(Err(error.clone()));
+    //         }
 
-            match state.core.state() {
-                ClientState::Connected
-                | ClientState::Authenticating
-                | ClientState::Authenticated => Poll::Ready(Ok(())),
-                ClientState::Disconnected if state.core.retry_count > 0 => {
-                    Poll::Ready(Err(IggyError::CannotEstablishConnection))
-                }
-                _ => {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }
-        })
-        .await
-    }
+    //         match state.core.state() {
+    //             ClientState::Connected
+    //             | ClientState::Authenticating
+    //             | ClientState::Authenticated => Poll::Ready(Ok(())),
+    //             ClientState::Disconnected if state.core.retry_count > 0 => {
+    //                 Poll::Ready(Err(IggyError::CannotEstablishConnection))
+    //             }
+    //             _ => {
+    //                 cx.waker().wake_by_ref();
+    //                 Poll::Pending
+    //             }
+    //         }
+    //     })
+    //     .await
+    // }
 }
 
 #[async_trait]
-impl Client for NewTcpClient {
+impl<S: AsyncIO + Debug + Send + Sync> Client for NewTcpClient<S> {
     async fn connect(&self) -> Result<(), IggyError> {
-        {
-            let state = self.state.lock().unwrap();
-            match state.core.state() {
-                ClientState::Connected
-                | ClientState::Authenticating
-                | ClientState::Authenticated => {
-                    debug!("Already connected");
-                    return Ok(());
-                }
-                ClientState::Connecting => {
-                    debug!("Already connecting");
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
+        let socket = TcpStream::connect(&self.config.server_address).await?;
+        let socket_compat = socket.compat();
+        let socket = Box::pin(socket_compat);
 
-        let transport = self.transport.clone();
-        let runtime = self.runtime.clone();
-
-        runtime.spawn(Box::pin(async move {
-            let mut transport_guard = transport.lock().await;
-            if let Some(transport) = transport_guard.take() {
-                let mut transport = transport;
-                transport.run().await;
-            }
-        }));
-
-        let timeout =
-            tokio::time::timeout(Duration::from_secs(30), self.wait_for_connection()).await;
-
-        match timeout {
-            Ok(result) => result,
-            Err(_) => Err(IggyError::ConnectionTimeout),
-        }
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.client_command_tx
+            .send(ClientCommand::Connect((tx, socket)))
+            .map_err(|_| IggyError::ConnectionTimeout)?;
+        rx.await.unwrap();
+        Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        let mut state = self.state.lock().unwrap();
-        state.core.on_disconnected();
-        // TODO add stop transport
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.client_command_tx
+            .send(ClientCommand::Disconnect(tx))
+            .map_err(|_| IggyError::ConnectionTimeout)?;
+        rx.await.unwrap();
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        // TODO add stop transport
-        let mut state = self.state.lock().unwrap();
-        state.core.shutdown();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.client_command_tx
+            .send(ClientCommand::Shutdown(tx))
+            .map_err(|_| IggyError::ConnectionTimeout)?;
+        rx.await.unwrap();
         Ok(())
     }
 
@@ -446,7 +488,7 @@ impl Client for NewTcpClient {
 }
 
 #[async_trait]
-impl BinaryTransport for NewTcpClient {
+impl<S: AsyncIO + Debug + Send + Sync> BinaryTransport for NewTcpClient<S> {
     async fn get_state(&self) -> ClientState {
         let state = self.state.lock().unwrap();
         state.core.state()
@@ -477,4 +519,4 @@ impl BinaryTransport for NewTcpClient {
     }
 }
 
-impl BinaryClient for NewTcpClient {}
+impl<S: AsyncIO + Debug + Send + Sync> BinaryClient for NewTcpClient<S> {}
