@@ -69,7 +69,7 @@ internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<
                 var headersJsonArray = headersElement.EnumerateObject();
                 foreach (var header in headersJsonArray)
                 {
-                    //TODO - look into getting rid of this boxing 
+                    //TODO - look into getting rid of this boxing
                     var headerKey = header.Name;
                     var headerObj = header.Value.EnumerateObject();
                     var headerKind = headerObj.First().Value.GetString();
