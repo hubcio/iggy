@@ -263,22 +263,25 @@ impl IggyShard {
         let cg = self
             .streams2
             .with_topic_by_id_mut(stream_id, topic_id, |topic| {
-                topic.consumer_groups_mut().with_mut(|container| {
-                    match group_id.kind {
-                        iggy_common::IdKind::Numeric => {
+                match group_id.kind {
+                    iggy_common::IdKind::Numeric => {
+                        topic.consumer_groups_mut().with_mut(|container| {
                             container.try_remove(group_id.get_u32_value().unwrap() as usize)
-                        }
-                        iggy_common::IdKind::String => {
-                            let key = group_id.get_cow_str_value().unwrap().to_string();
-                            container.try_remove_by_key(&key)
-                        }
+                        })
                     }
-                    .ok_or_else(|| {
-                        //TODO: Fix the not found erros to accept Identifier instead of u32
-                        IggyError::ConsumerGroupIdNotFound(0, 0)
-                    })
-                })
-            })?;
+                    iggy_common::IdKind::String => {
+                        let key = group_id.get_string_value().unwrap();
+                        let id = topic
+                            .consumer_groups()
+                            .with_index(|index| *(index.get(&key).unwrap()));
+                        topic
+                            .consumer_groups_mut()
+                            .with_mut(|container| container.try_remove(id))
+                    }
+                }
+                // TODO: Fix
+            })
+            .ok_or_else(|| IggyError::ConsumerGroupIdNotFound(0, 0))?;
         Ok(cg)
     }
 

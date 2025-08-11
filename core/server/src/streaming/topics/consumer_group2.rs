@@ -1,6 +1,6 @@
 use crate::{
     binary::handlers::partitions,
-    slab::{IndexedSlab, Keyed, partitions::PARTITIONS_CAPACITY},
+    slab::{Keyed, partitions::PARTITIONS_CAPACITY},
 };
 use ahash::AHashMap;
 use arcshift::ArcShift;
@@ -39,7 +39,7 @@ impl ConsumerGroup {
         self.id
     }
 
-    pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {
+    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
         let idx = container.insert(self);
         let group = &mut container[idx];
         group.id = idx;

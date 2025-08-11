@@ -1,7 +1,7 @@
 use crate::streaming::stats::stats::PartitionStats;
 use crate::{
     slab::{
-        IndexedSlab, Keyed,
+        Keyed,
         consumer_groups::ConsumerGroups,
         partitions::{PARTITIONS_CAPACITY, Partitions},
     },
@@ -137,7 +137,7 @@ impl Topic {
         &mut self.consumer_group_offsets
     }
 
-    pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {
+    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
         let idx = container.insert(self);
         let topic = &mut container[idx];
         topic.id = idx;

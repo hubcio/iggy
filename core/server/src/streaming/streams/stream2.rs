@@ -1,7 +1,8 @@
 use bytes::{BufMut, BytesMut};
 use iggy_common::IggyTimestamp;
+use slab::Slab;
 
-use crate::slab::{IndexedSlab, Keyed, topics::Topics};
+use crate::slab::{Keyed, topics::Topics};
 
 #[derive(Debug)]
 pub struct Stream {
@@ -65,7 +66,7 @@ impl Stream {
         self.topics.len()
     }
 
-    pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {
+    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
         let idx = container.insert(self);
         let stream = &mut container[idx];
         stream.id = idx;

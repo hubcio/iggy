@@ -1,16 +1,21 @@
-use crate::slab::traits::{Access, AccessMut};
 use crate::{
-    slab::traits::{Decompose, Project, ProjectMut},
+    slab::traits_ext::{
+        Borrow, Components, EntityComponentSystem, IndexComponents, IntoComponents,
+    },
     streaming::{
         deduplication::message_deduplicator::MessageDeduplicator, partitions::partition2, segments,
         stats::stats::PartitionStats,
     },
 };
 use slab::Slab;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::{
+    ops::Index,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 pub const PARTITIONS_CAPACITY: usize = 16384;
+type Idx = usize;
 
 #[derive(Debug)]
 pub struct Partitions {
@@ -19,6 +24,61 @@ pub struct Partitions {
     segments: Slab<Vec<segments::Segment2>>,
     message_deduplicators: Slab<Option<MessageDeduplicator>>,
     partition_offsets: Slab<Arc<AtomicU64>>,
+}
+
+pub struct Part {
+    partition: partition2::Partition,
+}
+
+impl IntoComponents for Part {
+    type Components = (partition2::Partition,);
+
+    fn into_components(self) -> Self::Components {
+        (self.partition,)
+    }
+}
+
+pub struct PartRef<'a> {
+    partition: &'a Slab<partition2::Partition>,
+}
+
+pub struct PartItemRef<'a> {
+    partition: &'a partition2::Partition,
+}
+
+impl<'a> IntoComponents for PartRef<'a> {
+    type Components = (&'a Slab<partition2::Partition>,);
+
+    fn into_components(self) -> Self::Components {
+        (self.partition,)
+    }
+}
+
+impl<'a> IndexComponents<Idx> for PartRef<'a> {
+    type Output = (&'a partition2::Partition,);
+
+    fn index(&self, index: Idx) -> Self::Output {
+        (&self.partition[index],)
+    }
+}
+
+impl EntityComponentSystem<Idx, Borrow> for Partitions {
+    type Entity = Part;
+    type EntityRef<'a> = PartRef<'a>;
+
+    fn with<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O,
+    {
+        todo!()
+    }
+
+    async fn with_async<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> FnOnce(Components<Self::EntityRef<'a>>) -> O,
+    {
+        todo!()
+    }
 }
 
 impl Default for Partitions {
