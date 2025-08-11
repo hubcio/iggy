@@ -110,11 +110,12 @@ pub struct State<S: AsyncIO, F: SocketFactory<S>> {
     wait_timer: Option<Pin<Box<Sleep>>>,
     send_buf: Mutex<VecDeque<(u32, Bytes)>>,
     ready_responses: HashMap<u64, Result<Bytes, IggyError>>,
+    ready_commands: VecDeque<Waker>,
     pub recv_waiters: HashMap<u64, Waker>,
+    pub recv_command_waiters: VecDeque<Waker>,
     client_commands_rx: flume::Receiver<ClientCommand>,
     config: Arc<TcpClientConfig>,
     pending_requests: VecDeque<ClientCommand>,
-    next_request_id: u64,
 }
 
 impl<S: AsyncIO, F: SocketFactory<S>> State<S, F> {
@@ -125,30 +126,38 @@ impl<S: AsyncIO, F: SocketFactory<S>> State<S, F> {
     }
 
     fn enqueu_command(&mut self, command: ClientCommand) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
+        let id = match &command {
+            ClientCommand::Message((code, payload)) => {
+                let id = self.inner.core.send(*code, payload.clone()).unwrap();
+                id
+            }
+            _ => 0
+        };
         self.pending_requests.push_back(command);
         id
     }
 
-    fn drive_client_commands(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        let fut = self.client_commands_rx.recv_async();
-        loop {
-            match Pin::new(&mut fut).poll(cx) {
-                Poll::Pending => return Ok(false),
-                Poll::Ready(Ok(cmd)) => {
-                    match cmd {
-                        ClientCommand::Connect((tx, socket)) => {
-                            // TODO add core.poll
-                            self.socket = socket;
-                            tx.send(());
-                        },
-                        _ => {todo!("обработать")}
-                    }
+    fn drive_client_commands(&mut self) -> bool {
+        for cmd in self.pending_requests.drain(..) {
+            match cmd {
+                ClientCommand::Connect((server_addr)) => {
+                    // TODO add core.poll
+                    let socket = (self.socket_factory)(&server_addr).unwrap();
+                    self.socket = Some(socket);
                 }
-                Poll::Ready(Err(e)) => return Err(e)
+                ClientCommand::Disconnect => {
+                    todo!("disconnect");
+                }
+                ClientCommand::Shutdown => {
+                    todo!("shutdown");
+                }
+                _ => {}
+                // ClientCommand::Message((code, payload)) => {
+                //     let _ = self.inner.core.send(code, payload).unwrap();
+                // }
             }
         }
+        true
     }
 
     fn drive_timer(&mut self, cx: &mut Context<'_>) -> bool {
@@ -163,18 +172,24 @@ impl<S: AsyncIO, F: SocketFactory<S>> State<S, F> {
 
     fn drive_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         let mut offset = self.send_offset;
+        let socket = self.socket.as_mut().ok_or(io::Error::new(
+            io::ErrorKind::NotConnected, 
+            "No socket"
+        ))?;
+
         if let Some(buf) = self.current_send.take() {
             while self.send_offset < buf.data.len() {
-                match self.socket.as_mut().poll_write(cx, &buf.data[offset..])? {
+                match Pin::new(&mut *socket).poll_write(cx, &buf.data[offset..])? {
                     Poll::Ready(n) => {
                         offset += n;
+                        self.send_offset += n;
                     }
                     Poll::Pending => return Ok(false),
                 }
             }
-            match self.socket.as_mut().poll_flush(cx)? {
+            match Pin::new(socket).poll_flush(cx)? {
                 Poll::Pending => return Ok(false),
-                Poll::Ready(n_) => {}
+                Poll::Ready(()) => {}
             }
             self.current_send = None;
         }
@@ -271,7 +286,7 @@ impl<S: AsyncIO> Future for ConnectionDriver<S> {
             Order::Connect => {todo!("добавить вызов метода из state")}
         }
 
-        keep_going |= st.drive_client_commands(cx)?;
+        keep_going |= st.drive_client_commands();
         keep_going |= st.drive_transmit(cx)?;
         keep_going |= st.drive_receive(cx)?;
 
@@ -419,36 +434,29 @@ impl<S: AsyncIO> NewTcpClient<S> {
     }
 
     async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let request_id = {
-            let mut state = self.state.lock().unwrap();
-            let id = state.core.send(code, payload)?;
-
-            if let Some(waker) = state.driver.take() {
-                waker.wake();
-            }
-
-            id
+        let id = {
+            // TODO вынести в отдельный метод для быстрого деструктурирования
+            let state = self.state.0.state.lock().unwrap();
+            // let id = 
+            state.enqueu_command(ClientCommand::Message((id, code, payload)))
         };
 
         poll_fn(move |cx| {
-            let mut state = self.state.lock().unwrap();
+            let state = self.state.0.state.lock().unwrap();
 
-            if let Some(ref error) = state.error {
-                return Poll::Ready(Err(error.clone()));
-            }
+            // if let Some(ref error) = state.error {
+            //     return Poll::Ready(Err(error.clone()));
+            // }
 
-            if let Some(result) = state.ready_responses.remove(&request_id) {
+            if let Some(result) = state.ready_responses.remove(&id) {
                 return Poll::Ready(result);
             }
 
-            state
-                .recv_waiters
-                .entry(request_id)
-                .or_insert_with(|| cx.waker().clone());
+            state.recv_waiters.insert(id, cx.waker().clone());
+            state.wake();
 
             Poll::Pending
-        })
-        .await
+        }).await
     }
 
     // async fn wait_for_connection(&self) -> Result<(), IggyError> {
@@ -501,7 +509,7 @@ impl<S: AsyncIO + Debug + Send + Sync> Client for NewTcpClient<S> {
                 return Poll::Ready(result);
             }
 
-            state.recv_waiters.insert(id, cx.waker().clone());
+            state.recv_command_waiters.push_back(cx.waker().clone());
             state.wake();
 
             Poll::Pending
@@ -522,16 +530,25 @@ impl<S: AsyncIO + Debug + Send + Sync> Client for NewTcpClient<S> {
             state.wake();
 
             Poll::Pending
-        )}.await 
+        }).await
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        self.client_command_tx
-            .send(ClientCommand::Shutdown(tx))
-            .map_err(|_| IggyError::ConnectionTimeout)?;
-        rx.await.unwrap();
-        Ok(())
+        let id = {
+            // TODO вынести в отдельный метод для быстрого деструктурирования
+            let state = self.state.0.state.lock().unwrap();
+            state.enqueu_command(ClientCommand::Shutdown)
+        };
+
+        poll_fn(move |cx| {
+            let state = self.state.0.state.lock().unwrap();
+            if let Some(result) = state.ready_responses.remove(&id) {
+                return Poll::Ready(result);
+            }
+            state.wake();
+
+            Poll::Pending
+        }).await
     }
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
