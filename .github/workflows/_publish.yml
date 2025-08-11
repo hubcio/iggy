@@ -1,0 +1,208 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# .github/workflows/_publish.yml
+name: _publish
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        required: false
+        default: false
+        description: "Run in dry-run mode"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IGGY_CI_BUILD: true
+
+jobs:
+  parse:
+    name: Parse tag
+    runs-on: ubuntu-latest
+    outputs:
+      matched: ${{ steps.p.outputs.matched }}
+      version: ${{ steps.p.outputs.version }}
+      targets: ${{ steps.p.outputs.targets }}
+      valid: ${{ steps.p.outputs.valid }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load publish config
+        id: config
+        run: |
+          if ! command -v yq &> /dev/null; then
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /tmp/yq
+            sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+
+          echo "publish_config=$(yq -o=json -I=0 '.publish' .github/ci/config/publish.yml | jq -c)" >> $GITHUB_OUTPUT
+
+      - name: Parse tag and determine targets
+        id: p
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ref = context.ref;
+            const tag = ref.split('/').pop();
+            console.log(`Processing tag: ${tag}`);
+
+            const configJson = `${{ steps.config.outputs.publish_config }}`;
+            let config = {};
+            try {
+              config = JSON.parse(configJson);
+            } catch (e) {
+              console.log('Failed to parse publish config');
+              core.setFailed('Invalid publish configuration');
+              core.setOutput('valid', 'false');
+              return;
+            }
+
+            for (const [name, cfg] of Object.entries(config)) {
+              const re = new RegExp('^' + cfg.tag_pattern + '$');
+              if (tag.match(re)) {
+                const version = tag.match(/([0-9]+\.[0-9]+\.[0-9]+)/)?.[1] || '';
+                console.log(`✓ Matched: ${name}, Version: ${version}`);
+
+                core.setOutput('matched', name);
+                core.setOutput('version', version);
+                core.setOutput('targets', JSON.stringify(cfg.targets || []));
+                core.setOutput('valid', 'true');
+                return;
+              }
+            }
+
+            console.log(`✗ Tag ${tag} didn't match any publish pattern`);
+            core.setOutput('valid', 'false');
+            core.setFailed(`Tag ${tag} didn't match any publish pattern`);
+
+  publish:
+    name: Publish ${{ matrix.target.type }}
+    needs: parse
+    if: needs.parse.outputs.valid == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.parse.outputs.targets) }}
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Publish (Docker)
+        if: matrix.target.type == 'docker-buildx'
+        uses: ./.github/actions/docker-buildx
+        with:
+          component: ${{ matrix.target.component || '' }}
+          image: ${{ matrix.target.image || '' }}
+          dockerfile: ${{ matrix.target.dockerfile || '' }}
+          version: ${{ needs.parse.outputs.version }}
+          push: ${{ !inputs.dry_run }}
+
+      - name: Publish (Rust crates)
+        if: matrix.target.type == 'rust'
+        uses: ./.github/actions/rust
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Publish (Python)
+        if: matrix.target.type == 'python-maturin'
+        uses: ./.github/actions/python-maturin
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Publish (Node)
+        if: matrix.target.type == 'node-npm'
+        uses: ./.github/actions/node-npm
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Publish (Java)
+        if: matrix.target.type == 'java-gradle'
+        uses: ./.github/actions/java-gradle
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Publish (C#)
+        if: matrix.target.type == 'csharp-dotnet'
+        uses: ./.github/actions/csharp-dotnet
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+      MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+  summary:
+    name: Publish Summary
+    needs: [parse, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "# 📦 Publish Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.parse.outputs.valid }}" != "true" ]; then
+            echo "❌ Invalid tag - no matching publish pattern" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "- **Component**: ${{ needs.parse.outputs.matched }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.parse.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ needs.publish.result }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create issue on failure
+        if: failure() && !inputs.dry_run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `Publish failed for ${tag}`,
+              body: `Failed to publish tag \`${tag}\`\n\n[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              labels: ['ci', 'publish-failure', 'automated']
+            });

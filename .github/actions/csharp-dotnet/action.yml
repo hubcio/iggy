@@ -1,0 +1,176 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: csharp-dotnet
+description: .NET test/build/publish
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: "8.0.x"
+        
+    - name: Restore dependencies
+      shell: bash
+      run: |
+        cd foreign/csharp
+        dotnet restore
+        
+    - name: Build
+      if: inputs.task == 'test' || inputs.task == 'build' || inputs.task == 'publish' || inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        dotnet build --no-restore
+        
+    - name: Lint (Code Analysis)
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Run code analysis
+        dotnet build --no-restore /p:EnforceCodeStyleInBuild=true /p:TreatWarningsAsErrors=false
+        
+        # Format check (requires dotnet-format tool)
+        if command -v dotnet-format &> /dev/null; then
+          dotnet format --verify-no-changes --verbosity diagnostic
+        else
+          echo "dotnet-format not installed, skipping format check"
+        fi
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Run unit tests (matching old CI)
+        dotnet test Iggy_SDK_Tests --no-build --verbosity normal
+        
+        # Run integration tests
+        dotnet test Iggy_SDK.Tests.Integration --no-build --verbosity normal
+        
+        # Run BDD tests if they exist
+        if [ -d "Iggy_SDK.Tests.BDD" ]; then
+          dotnet test Iggy_SDK.Tests.BDD --no-build --verbosity normal
+        fi
+        
+    - name: Integration Test (E2E)
+      if: inputs.task == 'e2e'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Start Iggy server in background if not already running
+        if ! nc -z localhost 8090 2>/dev/null; then
+          echo "Starting Iggy server for integration tests..."
+          cd ../../
+          cargo build --bin iggy-server
+          ./target/debug/iggy-server &
+          SERVER_PID=$!
+          
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if nc -z localhost 8090 2>/dev/null; then
+              echo "Iggy server is ready"
+              break
+            fi
+            sleep 1
+          done
+          
+          cd foreign/csharp
+        fi
+        
+        # Build if needed
+        dotnet build --no-restore
+        
+        # Run integration tests
+        dotnet test Iggy_SDK.Tests.Integration --no-build --verbosity normal
+        
+        # Cleanup server if we started it
+        if [ ! -z "$SERVER_PID" ]; then
+          kill $SERVER_PID || true
+        fi
+        
+    - name: Build Release
+      if: inputs.task == 'build' || inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Build in Release mode
+        dotnet build -c Release --no-restore
+        
+        # List build output
+        echo "Build output:"
+        find . -name "*.dll" -path "*/bin/Release/*" | head -20 || echo "No DLLs found in Release folders"
+        
+    - name: Pack NuGet packages
+      if: inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Set version if provided
+        if [ -n "${{ inputs.version }}" ]; then
+          dotnet pack -c Release \
+            -p:PackageVersion=${{ inputs.version }} \
+            -o ./nupkgs \
+            --no-build
+        else
+          dotnet pack -c Release -o ./nupkgs --no-build
+        fi
+        
+        # List packages
+        echo "NuGet packages:"
+        ls -la ./nupkgs/ || echo "No packages found"
+        
+    - name: Publish to NuGet
+      if: inputs.task == 'publish'
+      shell: bash
+      env:
+        NUGET_API_KEY: ${{ env.NUGET_API_KEY }}
+      run: |
+        cd foreign/csharp
+        
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "Dry run - would publish these packages:"
+          ls -la ./nupkgs/*.nupkg
+        else
+          # Push to NuGet
+          for package in ./nupkgs/*.nupkg; do
+            dotnet nuget push "$package" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
+        fi

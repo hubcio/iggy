@@ -57,7 +57,7 @@ async fn main() -> Result<(), ServerError> {
 
     if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
         if dotenvy::from_path(&env_path).is_ok() {
-            println!("Loaded environment variables from path: {env_path}");
+            println!("Loaded environment variables from path: {env_path} XDds");
         }
     } else if let Ok(path) = dotenv() {
         println!(

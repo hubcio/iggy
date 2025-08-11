@@ -1,0 +1,121 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# .github/ci/config/components.yml
+components:
+  rust:
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Dockerfile*"
+    tasks:
+      - "check"
+      - "fmt"
+      - "clippy"
+      - "sort"
+      - "doctest"
+      - "machete"
+      - "test"
+      - "readme-examples"
+      - "compat"
+
+  sdk-python:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/sdk/**/*.rs"
+      - "core/common/**/*.rs"
+      - "core/server/**/*.rs"
+      - "foreign/python/**"
+    tasks: ["lint", "test", "build"]
+
+  sdk-node:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/sdk/**/*.rs"
+      - "core/common/**/*.rs"
+      - "core/server/**/*.rs"
+      - "foreign/node/**"
+    tasks: ["lint", "test", "build", "e2e"]
+
+  sdk-go:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/sdk/**/*.rs"
+      - "core/common/**/*.rs"
+      - "core/server/**/*.rs"
+      - "foreign/go/**"
+      - "bdd/go/**"
+      - "examples/go/**"
+    tasks: ["lint", "test", "build"]
+
+  sdk-java:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/sdk/**/*.rs"
+      - "core/common/**/*.rs"
+      - "core/server/**/*.rs"
+      - "foreign/java/**"
+    tasks: ["lint", "test", "build"]
+
+  sdk-csharp:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/sdk/**/*.rs"
+      - "core/common/**/*.rs"
+      - "core/server/**/*.rs"
+      - "foreign/csharp/**"
+    tasks: ["lint", "test", "build"]
+
+  bdd-suite:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/_bdd.yml"
+      - "bdd/**"
+      - "core/sdk/**/*.rs"
+      - "core/common/**/*.rs"
+      - "core/server/**/*.rs"
+      - "foreign/python/**"
+      - "foreign/node/**"
+      - "foreign/go/**"
+      - "foreign/java/**"
+      - "foreign/csharp/**"
+      - "scripts/run-bdd-tests.sh"
+    tasks: ["bdd-rust", "bdd-python", "bdd-go", "bdd-node", "bdd-csharp"]
+
+  examples:
+    paths:
+      - "examples/**"
+    tasks: ["test"]
+
+  web-ui:
+    paths:
+      - "web/**"
+    tasks: ["lint", "build"]
+
+  bench-dashboard:
+    paths:
+      - "core/bench/dashboard/**"
+      - "scripts/dashboard/**"
+    tasks: ["build"]

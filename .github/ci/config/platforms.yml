@@ -15,24 +15,36 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "bench-runner"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
+docker:
+  linux: 
+    - linux/amd64
+    - linux/arm64
+    # - linux/arm/v7
+    # - linux/ppc64le
+    # - linux/s390x
+    # - linux/386
+    # - linux/riscv64
 
-[[bin]]
-name = "iggy-bench-runner"
-path = "src/main.rs"
+binaries:
+  rust-musl:
+    - x86_64-unknown-linux-musl
+    - aarch64-unknown-linux-musl
+  
+  rust-gnu:
+    - x86_64-unknown-linux-gnu
+    - aarch64-unknown-linux-gnu
+  
+  rust-windows:
+    - x86_64-pc-windows-msvc
+  
+  rust-macos:
+    - x86_64-apple-darwin
+    - aarch64-apple-darwin
 
-[dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-dircpy = "0.3.19"
-git2 = { version = "0.20.2", default-features = false, features = [
-    "vendored-libgit2",
-] }
-tempfile = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+test-platforms:
+  primary:
+    - ubuntu-latest
+  extended:
+    - ubuntu-latest
+    - windows-latest
+    - macos-latest

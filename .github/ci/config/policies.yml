@@ -1,0 +1,76 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+gates:
+  always_required:
+    - license-headers
+    - license-list
+    - markdown
+    - pr-title
+  required_on_pr:
+    - test
+    - check
+    - fmt
+    - clippy
+    - sort
+    - doctest
+    - machete
+    - security
+    - compat
+    - bdd
+  required_for_merge:
+    - test
+    - check
+    - fmt
+    - clippy
+
+tag_patterns:
+  server: "server-[0-9]+\\.[0-9]+\\.[0-9]+"
+  rust-cli: "cli-[0-9]+\\.[0-9]+\\.[0-9]+"
+  rust-sdk: "sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-python: "python-v[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-node: "node-sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-java: "java-sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-csharp: "csharp-sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-go: "foreign/go/v[0-9]+\\.[0-9]+\\.[0-9]+"
+  connectors-runtime: "connectors-[0-9]+\\.[0-9]+\\.[0-9]+"
+  mcp: "mcp-[0-9]+\\.[0-9]+\\.[0-9]+"
+  web-ui: "web-ui-[0-9]+\\.[0-9]+\\.[0-9]+"
+
+concurrency:
+  cancel_in_progress_pr: true
+  cancel_in_progress_push: true
+  group_by: "${{ github.workflow }}-${{ github.ref }}"
+
+timeouts:
+  default: 30
+  extended_test: 60
+  docker_build: 45
+  publish: 30
+
+cache:
+  rust_cache: true
+  docker_layer_cache: true
+  npm_cache: true
+  gradle_cache: true
+  dotnet_cache: true
+  go_cache: true
+
+notifications:
+  auto_issue_on_failure: true
+  issue_labels: ["ci", "automated"]
+  slack_webhook: false

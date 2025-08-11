@@ -1,0 +1,90 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Publish
+on:
+  push:
+    tags:
+      - server-[0-9]+.[0-9]+.[0-9]+*
+      - server-v[0-9]+.[0-9]+.[0-9]+*
+      - cli-[0-9]+.[0-9]+.[0-9]+*
+      - cli-v[0-9]+.[0-9]+.[0-9]+*
+      - iggy-[0-9]+.[0-9]+.[0-9]+*
+      - iggy-v[0-9]+.[0-9]+.[0-9]+*
+      - bench-dashboard-[0-9]+.[0-9]+.[0-9]+*
+      - bench-dashboard-v[0-9]+.[0-9]+.[0-9]+*
+      - python-v[0-9]+.[0-9]+.[0-9]+
+      - node-sdk-[0-9]+.[0-9]+.[0-9]+
+      - java-sdk-[0-9]+.[0-9]+.[0-9]+
+      - csharp-sdk-[0-9]+.[0-9]+.[0-9]+
+      - foreign/go/v[0-9]+.[0-9]+.[0-9]+
+      - connectors-[0-9]+.[0-9]+.[0-9]+
+      - mcp-[0-9]+.[0-9]+.[0-9]+
+      - web-ui-[0-9]+.[0-9]+.[0-9]+
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (don't actually publish)"
+        required: false
+        default: true
+        type: boolean
+      tag:
+        description: "Tag to publish (leave empty to use current ref)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  IGGY_CI_BUILD: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish Release
+    uses: ./.github/workflows/_publish.yml
+    with:
+      dry_run: ${{ inputs.dry_run || false }}
+    secrets: inherit
+
+  notify-failure:
+    name: Notify on Failure
+    needs: publish
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `Publish failed for ${tag}`,
+              body: `The publish workflow failed for tag \`${tag}\`.\n\n[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              labels: ['ci', 'publish-failure', 'automated']
+            });

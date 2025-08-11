@@ -1,0 +1,158 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# .github/workflows/_detect.yml
+name: _detect
+on:
+  workflow_call:
+    outputs:
+      rust_matrix:
+        description: "Matrix for Rust components"
+        value: ${{ jobs.detect.outputs.rust_matrix }}
+      python_matrix:
+        description: "Matrix for Python SDK"
+        value: ${{ jobs.detect.outputs.python_matrix }}
+      node_matrix:
+        description: "Matrix for Node SDK"
+        value: ${{ jobs.detect.outputs.node_matrix }}
+      go_matrix:
+        description: "Matrix for Go SDK"
+        value: ${{ jobs.detect.outputs.go_matrix }}
+      java_matrix:
+        description: "Matrix for Java SDK"
+        value: ${{ jobs.detect.outputs.java_matrix }}
+      csharp_matrix:
+        description: "Matrix for C# SDK"
+        value: ${{ jobs.detect.outputs.csharp_matrix }}
+      other_matrix:
+        description: "Matrix for other components"
+        value: ${{ jobs.detect.outputs.other_matrix }}
+
+concurrency:
+  group: detect-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    env:
+      IGGY_CI_BUILD: true
+    outputs:
+      rust_matrix: ${{ steps.mk.outputs.rust_matrix }}
+      python_matrix: ${{ steps.mk.outputs.python_matrix }}
+      node_matrix: ${{ steps.mk.outputs.node_matrix }}
+      go_matrix: ${{ steps.mk.outputs.go_matrix }}
+      java_matrix: ${{ steps.mk.outputs.java_matrix }}
+      csharp_matrix: ${{ steps.mk.outputs.csharp_matrix }}
+      other_matrix: ${{ steps.mk.outputs.other_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files (PR or push)
+        id: changed
+        uses: Ana06/get-changed-files@v1.2
+        with:
+          format: json
+
+      - name: Load components config
+        id: config
+        run: |
+          if ! command -v yq &> /dev/null; then
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /tmp/yq
+            sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+          echo "components=$(yq -o=json -I=0 '.' .github/ci/config/components.yml | jq -c)" >> $GITHUB_OUTPUT
+
+      - name: Build matrices
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const componentsJson = `${{ steps.config.outputs.components }}`;
+            const changedFilesJson = `${{ steps.changed.outputs.all || '[]' }}`;
+
+            let componentsCfg = { components: {} };
+            try { componentsCfg = JSON.parse(componentsJson); } catch {}
+            const components = componentsCfg.components || {};
+
+            let changedFiles = [];
+            try { changedFiles = JSON.parse(changedFilesJson); } catch {}
+            const files = changedFiles.map(p => p.replace(/\\/g, '/'));
+
+            const escapeRe = s => s.replace(/([.+^${}()|[\]\\])/g, '\\$1');
+
+            const globToRegex = (pattern) => {
+              let s = escapeRe(pattern);
+              s = s.replace(/\*\*\/+/g, '(?:.*/)?');   // '**/' -> any subpath (optional)
+              s = s.replace(/\/\*\*$/g, '(?:/.*)?');   // '/**' at end -> rest of path
+              s = s.replace(/\*\*/g, '.*');           // remaining '**'
+              s = s.replace(/\*/g, '[^/]*');          // '*'
+              s = s.replace(/\?/g, '[^/]');           // '?'
+              return new RegExp(`^${s}$`);
+            };
+
+            const rxCache = new Map();
+            const test = (file, patterns) => {
+              for (const pat of patterns) {
+                let rx = rxCache.get(pat);
+                if (!rx) { rx = globToRegex(pat); rxCache.set(pat, rx); }
+                if (rx.test(file)) return true;
+              }
+              return false;
+            };
+
+            const groups = { rust:[], python:[], node:[], go:[], java:[], csharp:[], other:[] };
+
+            for (const [name, cfg] of Object.entries(components)) {
+              const pats = (cfg.paths || []);
+              const affected = files.some(f => test(f, pats));
+              if (!affected) continue;
+              const entries = (cfg.tasks || []).map(task => ({ component: name, task }));
+              if (name === 'rust') groups.rust.push(...entries);
+              else if (name === 'sdk-python') groups.python.push(...entries);
+              else if (name === 'sdk-node') groups.node.push(...entries);
+              else if (name === 'sdk-go') groups.go.push(...entries);
+              else if (name === 'sdk-java') groups.java.push(...entries);
+              else if (name === 'sdk-csharp') groups.csharp.push(...entries);
+              else groups.other.push(...entries);
+            }
+
+            if (context.eventName === 'push' && context.ref === 'refs/heads/master') {
+              for (const [name, cfg] of Object.entries(components)) {
+                const entries = (cfg.tasks || []).map(task => ({ component: name, task }));
+                if (name === 'rust') groups.rust.push(...entries);
+                else if (name === 'sdk-python') groups.python.push(...entries);
+                else if (name === 'sdk-node') groups.node.push(...entries);
+                else if (name === 'sdk-go') groups.go.push(...entries);
+                else if (name === 'sdk-java') groups.java.push(...entries);
+                else if (name === 'sdk-csharp') groups.csharp.push(...entries);
+                else groups.other.push(...entries);
+              }
+            }
+
+            const matrix = a => a.length ? { include: a } : { include: [{ component: 'noop', task: 'noop' }] };
+
+            core.setOutput('rust_matrix', JSON.stringify(matrix(groups.rust)));
+            core.setOutput('python_matrix', JSON.stringify(matrix(groups.python)));
+            core.setOutput('node_matrix', JSON.stringify(matrix(groups.node)));
+            core.setOutput('go_matrix', JSON.stringify(matrix(groups.go)));
+            core.setOutput('java_matrix', JSON.stringify(matrix(groups.java)));
+            core.setOutput('csharp_matrix', JSON.stringify(matrix(groups.csharp)));
+            core.setOutput('other_matrix', JSON.stringify(matrix(groups.other)));
