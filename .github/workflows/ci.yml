@@ -1,0 +1,181 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# .github/workflows/ci.yml
+name: CI
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  IGGY_CI_BUILD: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  # Common checks - always run
+  common:
+    name: Common checks
+    uses: ./.github/workflows/_common.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  # Detect changes and build matrices
+  detect:
+    name: Detect changes
+    uses: ./.github/workflows/_detect.yml
+
+  # Rust components
+  test-rust:
+    name: Rust • ${{ matrix.component }}/${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.rust_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.rust_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Python SDK
+  test-python:
+    name: Python • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.python_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Node SDK
+  test-node:
+    name: Node • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.node_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Go SDK
+  test-go:
+    name: Go • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.go_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Java SDK
+  test-java:
+    name: Java • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.java_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # C# SDK
+  test-csharp:
+    name: C# • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.csharp_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Other components
+  test-other:
+    name: Other • ${{ matrix.component }}/${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.other_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Final status check
+  status:
+    name: CI Status
+    runs-on: ubuntu-latest
+    needs: [common, detect, test-rust, test-python, test-node, test-go, test-java, test-csharp, test-other]
+    if: always()
+    steps:
+      - name: Check status
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Language test results
+          echo "### Language Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Language | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🦀 Rust | ${{ needs.test-rust.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐍 Python | ${{ needs.test-python.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟢 Node | ${{ needs.test-node.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐹 Go | ${{ needs.test-go.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ☕ Java | ${{ needs.test-java.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔷 C# | ${{ needs.test-csharp.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Other | ${{ needs.test-other.result }} |" >> $GITHUB_STEP_SUMMARY
+          
+          # Overall status
+          if contains(needs.*.result, 'failure'); then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **CI Failed** - Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          elif contains(needs.*.result, 'cancelled'); then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **CI Passed** - All checks completed successfully!" >> $GITHUB_STEP_SUMMARY
+          fi

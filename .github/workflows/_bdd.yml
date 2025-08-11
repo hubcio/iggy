@@ -1,0 +1,187 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Cross-SDK BDD Tests
+
+on:
+  workflow_call:
+    inputs:
+      server_image:
+        type: string
+        required: false
+        default: apache/iggy:edge
+        description: "Server image to test against"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bdd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bdd-tests:
+    name: BDD tests (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    env:
+      IGGY_CI_BUILD: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [rust, python, go, node, csharp]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Rust dependencies
+        if: matrix.sdk == 'rust' || matrix.sdk == 'python'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            foreign/python -> target
+          cache-on-failure: true
+          key: bdd-${{ matrix.sdk }}
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-bdd-${{ matrix.sdk }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-bdd-${{ matrix.sdk }}-
+            ${{ runner.os }}-buildx-bdd-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run BDD tests for ${{ matrix.sdk }}
+        id: test
+        run: |
+          set +e  # Allow script to continue on test failures
+          ./scripts/run-bdd-tests.sh ${{ matrix.sdk }}
+          TEST_EXIT_CODE=$?
+          echo "exit_code=$TEST_EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          # Set test status
+          if [ $TEST_EXIT_CODE -eq 0 ]; then
+            echo "status=✅ Passed" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=❌ Failed" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit $TEST_EXIT_CODE
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bdd-${{ matrix.sdk }}-results-${{ github.run_id }}
+          path: |
+            bdd/reports/**
+            bdd/**/test-results/**
+            bdd/**/*.xml
+            bdd/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          ./scripts/run-bdd-tests.sh clean || true
+          # Additional cleanup to free space
+          docker system prune -f || true
+
+  summary:
+    name: BDD Test Summary
+    needs: bdd-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bdd-*-results-${{ github.run_id }}
+          path: test-results
+
+      - name: Generate test summary
+        run: |
+          echo "## 🧪 BDD Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| SDK | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|---------|" >> $GITHUB_STEP_SUMMARY
+
+          # Parse actual test results from artifacts
+          for sdk in rust python go node csharp; do
+            RESULT_DIR="test-results/bdd-${sdk}-results-${{ github.run_id }}"
+            if [ -d "$RESULT_DIR" ]; then
+              # Check for common test result files
+              if find "$RESULT_DIR" -name "*.xml" -o -name "*test-results*" | grep -q .; then
+                # Try to extract test counts from various formats
+                TOTAL=0
+                PASSED=0
+                FAILED=0
+
+                # Parse JUnit XML if exists
+                if [ -f "$RESULT_DIR/bdd/reports/junit.xml" ] || [ -f "$RESULT_DIR/bdd/test-results/junit.xml" ]; then
+                  XML_FILE=$(find "$RESULT_DIR" -name "junit.xml" | head -1)
+                  if command -v xmllint > /dev/null 2>&1; then
+                    TOTAL=$(xmllint --xpath 'string(//@tests)' "$XML_FILE" 2>/dev/null || echo "0")
+                    FAILED=$(xmllint --xpath 'string(//@failures)' "$XML_FILE" 2>/dev/null || echo "0")
+                    PASSED=$((TOTAL - FAILED))
+                  fi
+                fi
+
+                # Determine status based on results
+                if [ "$FAILED" -eq 0 ] && [ "$TOTAL" -gt 0 ]; then
+                  STATUS="✅ Passed"
+                  DETAILS="$PASSED/$TOTAL tests passed"
+                elif [ "$TOTAL" -gt 0 ]; then
+                  STATUS="❌ Failed"
+                  DETAILS="$PASSED/$TOTAL tests passed, $FAILED failed"
+                else
+                  # No parseable results, check if any files exist
+                  if ls "$RESULT_DIR"/**/* > /dev/null 2>&1; then
+                    STATUS="⚠️ Completed"
+                    DETAILS="Test artifacts uploaded"
+                  else
+                    STATUS="⚠️ No Results"
+                    DETAILS="No test artifacts found"
+                  fi
+                fi
+              else
+                STATUS="⚠️ No Results"
+                DETAILS="No test results found"
+              fi
+            else
+              STATUS="⏭️ Skipped"
+              DETAILS="Test not executed"
+            fi
+
+            echo "| ${sdk^} | $STATUS | $DETAILS |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Test Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "Test results and logs have been uploaded as artifacts for detailed analysis." >> $GITHUB_STEP_SUMMARY
+
+          # Check overall status
+          if grep -q "❌ Failed" $GITHUB_STEP_SUMMARY; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Some tests failed. Please check the detailed logs for more information.**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
