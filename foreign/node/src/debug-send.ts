@@ -44,7 +44,7 @@ const opt: ClientConfig = {
   transport: 'TCP' as const,
   options: {
     port: 8090,
-    host: '127.0.0.1' ,
+    host: '127.0.0.1',
     // allowHalfOpen: true,
     // keepAlive: true
   },
@@ -118,6 +118,7 @@ try {
     cs.destroy();
     await cleanup();
   });
+
 
   cs.on('close', async () => {
     console.log('cli/=>>Stream CLOSE::')
