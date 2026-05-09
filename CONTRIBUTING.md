@@ -102,6 +102,21 @@ chore(integration): remove streaming tests superseded by API-level coverage
 
 Keep subject under 72 chars. Use body for details if needed.
 
+## PR Triage Commands
+
+Comment-driven helpers for keeping the review queue scannable. Parsed line-by-line
+in PR comments by [`pr-triage.yml`](./.github/workflows/pr-triage.yml).
+
+| Command | Allowed by | Effect |
+| --- | --- | --- |
+| `/request-review @user` | committer or PR author | Requests review from `@user` |
+| `/ready` | committer or PR author | Sets `S-waiting-on-review`, removes `S-waiting-on-author` |
+| `/author` | committer | Sets `S-waiting-on-author`, removes `S-waiting-on-review` |
+
+Failures are silent. If a command appears not to fire, check the `PR Triage` run
+under the Actions tab for the reason (typically: insufficient permissions or
+unknown reviewer). Comment edits are not re-processed; post a new comment.
+
 ## Close Policy
 
 PRs may be closed if:

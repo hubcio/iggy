@@ -1,0 +1,157 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Triage
+
+# Comment-driven PR triage. Inspired by rust-lang/triagebot UX.
+#
+# Commands (parsed line-by-line in PR comments):
+#   /request-review @user  — request review from @user
+#   /ready                 — flip state to S-waiting-on-review
+#   /author                — flip state to S-waiting-on-author
+#
+# Auth gate:
+#   /request-review, /ready  -> repo COLLABORATOR/OWNER, or PR author
+#   /author                  -> repo COLLABORATOR/OWNER only
+#
+# Trigger choice: issue_comment.created only. Never pull_request_target,
+# never actions/checkout of PR refs — eliminates the pwn-request RCE class.
+# See: https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: pr-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    if: github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch commands
+        uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        with:
+          script: |
+            const LABEL_REVIEW = 'S-waiting-on-review';
+            const LABEL_AUTHOR = 'S-waiting-on-author';
+            const COMMITTER_ASSOCS = new Set(['COLLABORATOR', 'OWNER']);
+
+            const body = process.env.COMMENT_BODY || '';
+            const commentAuthor = process.env.COMMENT_AUTHOR;
+            const commentAssoc = process.env.COMMENT_ASSOC;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const isCommitter = COMMITTER_ASSOCS.has(commentAssoc);
+
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const prAuthor = pr.data.user.login;
+            const isPrAuthor = commentAuthor === prAuthor;
+
+            core.info(`comment_author=${commentAuthor} assoc=${commentAssoc} ` +
+                      `committer=${isCommitter} pr_author=${isPrAuthor}`);
+
+            // Per-line scan. First match per command class wins; lines without
+            // a match are silently ignored.
+            const lines = body.split(/\r?\n/).map(l => l.trim());
+            let sawReassign = false;
+            let sawReady = false;
+            let sawAuthor = false;
+
+            const setLabels = async (add, remove) => {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [add],
+              });
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: remove,
+                });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+            };
+
+            for (const line of lines) {
+              if (!sawReassign) {
+                const m = line.match(/^\/request-review\s+@(\S+)/);
+                if (m) {
+                  sawReassign = true;
+                  if (!(isCommitter || isPrAuthor)) {
+                    core.info(`/request-review: ignored, ${commentAuthor} lacks permission`);
+                  } else {
+                    const reviewer = m[1].replace(/^@/, '');
+                    try {
+                      await github.rest.pulls.requestReviewers({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        pull_number: prNumber,
+                        reviewers: [reviewer],
+                      });
+                      core.info(`/request-review: requested ${reviewer}`);
+                    } catch (e) {
+                      core.warning(`/request-review: failed for ${reviewer}: ${e.message}`);
+                    }
+                  }
+                  continue;
+                }
+              }
+              if (!sawReady && /^\/ready\b/.test(line)) {
+                sawReady = true;
+                if (!(isCommitter || isPrAuthor)) {
+                  core.info(`/ready: ignored, ${commentAuthor} lacks permission`);
+                } else {
+                  await setLabels(LABEL_REVIEW, LABEL_AUTHOR);
+                  core.info(`/ready: ${LABEL_REVIEW} <- ${LABEL_AUTHOR}`);
+                }
+                continue;
+              }
+              if (!sawAuthor && /^\/author\b/.test(line)) {
+                sawAuthor = true;
+                if (!isCommitter) {
+                  core.info(`/author: ignored, ${commentAuthor} not a committer`);
+                } else {
+                  await setLabels(LABEL_AUTHOR, LABEL_REVIEW);
+                  core.info(`/author: ${LABEL_AUTHOR} <- ${LABEL_REVIEW}`);
+                }
+                continue;
+              }
+            }
+
+            if (!sawReassign && !sawReady && !sawAuthor) {
+              core.info('no command matched');
+            }
