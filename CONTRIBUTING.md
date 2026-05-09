@@ -115,7 +115,7 @@ in PR comments by [`pr-triage.yml`](./.github/workflows/pr-triage.yml).
 
 Failures are silent. If a command appears not to fire, check the `PR Triage` run
 under the Actions tab for the reason (typically: insufficient permissions or
-unknown reviewer). Comment edits are not re-processed; post a new comment.
+unknown reviewer). Comment edits are not re-processed; post a new comment instead.
 
 ## Close Policy
 
