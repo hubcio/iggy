@@ -1,0 +1,219 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Triage
+
+# Comment-driven PR triage and lifecycle labels. Inspired by
+# rust-lang/triagebot UX.
+#
+# Comment commands (parsed line-by-line in PR comments):
+#   /request-review @user  — request review from @user
+#   /ready                 — flip state to S-waiting-on-review
+#   /author                — flip state to S-waiting-on-author
+#
+# Auth gate:
+#   /request-review, /ready  -> repo COLLABORATOR/OWNER, or PR author
+#   /author                  -> repo COLLABORATOR/OWNER only
+#
+# Lifecycle (pull_request_target):
+#   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present)
+#   ready_for_review       -> add S-waiting-on-review (only if no S-* present)
+#   converted_to_draft     -> remove both S-* labels
+#   closed (merged or not) -> remove both S-* labels
+#
+# SECURITY:
+# - issue_comment.created and pull_request_target are the ONLY triggers.
+# - No actions/checkout of any ref. PR-controlled code is never executed.
+# - The default GITHUB_TOKEN is never written to outputs, env files, or
+#   passed to user-supplied programs. The workflow only calls the GitHub
+#   REST API via actions/github-script.
+# - pull_request_target is used so fork-PR labels can be applied with the
+#   base-repo's write token. This is safe because we never run fork code:
+#   no checkout, no exec of PR contents, no token export. See
+#   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, ready_for_review, converted_to_draft, closed]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: pr-triage-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    if: |
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
+      || github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch
+        uses: actions/github-script@v9
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        with:
+          script: |
+            const LABEL_REVIEW = 'S-waiting-on-review';
+            const LABEL_AUTHOR = 'S-waiting-on-author';
+            const COMMITTER_ASSOCS = new Set(['COLLABORATOR', 'OWNER']);
+            const prNumber = Number(process.env.PR_NUMBER);
+
+            const removeLabelIfPresent = async (name) => {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name,
+                });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+            };
+
+            const setLabels = async (add, remove) => {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [add],
+              });
+              await removeLabelIfPresent(remove);
+            };
+
+            // ----- pull_request_target lifecycle -----
+            if (context.eventName === 'pull_request_target') {
+              const action = context.payload.action;
+              const pr = context.payload.pull_request;
+              const labels = pr.labels.map(l => l.name);
+              const hasState = labels.includes(LABEL_REVIEW)
+                            || labels.includes(LABEL_AUTHOR);
+
+              core.info(`lifecycle event=${action} draft=${pr.draft} ` +
+                        `has_state=${hasState}`);
+
+              if (action === 'closed' || action === 'converted_to_draft') {
+                await removeLabelIfPresent(LABEL_REVIEW);
+                await removeLabelIfPresent(LABEL_AUTHOR);
+                core.info(`lifecycle: cleared S-* labels (${action})`);
+                return;
+              }
+
+              if (action === 'opened' || action === 'ready_for_review') {
+                if (pr.draft) {
+                  core.info('lifecycle: draft PR, no label');
+                  return;
+                }
+                if (hasState) {
+                  core.info('lifecycle: S-* label already present, no change');
+                  return;
+                }
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: [LABEL_REVIEW],
+                });
+                core.info(`lifecycle: added ${LABEL_REVIEW}`);
+                return;
+              }
+
+              core.info(`lifecycle: unhandled action ${action}`);
+              return;
+            }
+
+            // ----- issue_comment commands -----
+            const body = process.env.COMMENT_BODY || '';
+            const commentAuthor = process.env.COMMENT_AUTHOR;
+            const commentAssoc = process.env.COMMENT_ASSOC;
+            const isCommitter = COMMITTER_ASSOCS.has(commentAssoc);
+
+            const prData = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const prAuthor = prData.data.user.login;
+            const isPrAuthor = commentAuthor === prAuthor;
+
+            core.info(`comment_author=${commentAuthor} assoc=${commentAssoc} ` +
+                      `committer=${isCommitter} pr_author=${isPrAuthor}`);
+
+            const lines = body.split(/\r?\n/).map(l => l.trim());
+            let sawReassign = false;
+            let sawReady = false;
+            let sawAuthor = false;
+
+            for (const line of lines) {
+              if (!sawReassign) {
+                const m = line.match(/^\/request-review\s+@(\S+)/);
+                if (m) {
+                  sawReassign = true;
+                  if (!(isCommitter || isPrAuthor)) {
+                    core.info(`/request-review: ignored, ${commentAuthor} lacks permission`);
+                  } else {
+                    const reviewer = m[1].replace(/^@/, '');
+                    try {
+                      await github.rest.pulls.requestReviewers({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        pull_number: prNumber,
+                        reviewers: [reviewer],
+                      });
+                      core.info(`/request-review: requested ${reviewer}`);
+                    } catch (e) {
+                      core.warning(`/request-review: failed for ${reviewer}: ${e.message}`);
+                    }
+                  }
+                  continue;
+                }
+              }
+              if (!sawReady && /^\/ready\b/.test(line)) {
+                sawReady = true;
+                if (!(isCommitter || isPrAuthor)) {
+                  core.info(`/ready: ignored, ${commentAuthor} lacks permission`);
+                } else {
+                  await setLabels(LABEL_REVIEW, LABEL_AUTHOR);
+                  core.info(`/ready: ${LABEL_REVIEW} <- ${LABEL_AUTHOR}`);
+                }
+                continue;
+              }
+              if (!sawAuthor && /^\/author\b/.test(line)) {
+                sawAuthor = true;
+                if (!isCommitter) {
+                  core.info(`/author: ignored, ${commentAuthor} not a committer`);
+                } else {
+                  await setLabels(LABEL_AUTHOR, LABEL_REVIEW);
+                  core.info(`/author: ${LABEL_AUTHOR} <- ${LABEL_REVIEW}`);
+                }
+                continue;
+              }
+            }
+
+            if (!sawReassign && !sawReady && !sawAuthor) {
+              core.info('no command matched');
+            }

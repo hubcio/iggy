@@ -102,6 +102,100 @@ chore(integration): remove streaming tests superseded by API-level coverage
 
 Keep subject under 72 chars. Use body for details if needed.
 
+## PR Triage Commands
+
+Comment-driven helpers that keep the review queue scannable. The
+[`PR Triage`](./.github/workflows/pr-triage.yml) workflow parses PR comments
+line-by-line and updates labels or reviewers via the GitHub API. No bot
+account is involved.
+
+### Commands
+
+| Command | Allowed by | Effect |
+| --- | --- | --- |
+| `/request-review @user` | committer or PR author | Requests review from `@user` |
+| `/ready` | committer or PR author | Sets `S-waiting-on-review`, removes `S-waiting-on-author` |
+| `/author` | committer | Sets `S-waiting-on-author`, removes `S-waiting-on-review` |
+
+Commands must appear at the **start of a line**. Multiple commands in one
+comment are processed in order; one command per category (reassign, ready,
+author) per comment.
+
+### Typical flow
+
+1. Author opens PR. CODEOWNERS auto-requests `@apache/iggy-committers`. The
+   PR has no triage label yet.
+2. A committer reviews. If changes are needed, they comment `/author` so the
+   PR drops out of the review queue and into the author's queue.
+3. Author pushes fixes, then comments `/ready`. PR re-enters the review
+   queue.
+4. Either party can comment `/request-review @specific-committer` to
+   reroute the PR to someone with relevant context.
+
+Filter the review queue with
+`is:open is:pr label:S-waiting-on-review`.
+
+### Lifecycle automation
+
+State labels are also kept in sync automatically based on PR events:
+
+| Event | Effect |
+| --- | --- |
+| PR opened (non-draft) | Adds `S-waiting-on-review` if no `S-*` label is set |
+| Draft marked ready for review | Adds `S-waiting-on-review` if no `S-*` label is set |
+| PR converted back to draft | Removes both `S-*` labels |
+| PR closed (merged or rejected) | Removes both `S-*` labels |
+
+Reopened PRs are intentionally not auto-labelled - drop a `/ready` or
+`/author` comment to put them back into a queue.
+
+### Behaviour and limits
+
+- **Auth gate.** `/request-review` and `/ready` accept the PR author or any
+  repo collaborator (committer). `/author` requires committer. Apache org
+  membership alone is not sufficient - the gate is repo-scoped to keep
+  unrelated podling members out.
+- **Silent failures.** The workflow never replies with comments. If a
+  command does not visibly take effect, open the `PR Triage` run under the
+  repo's Actions tab; the run log says exactly why (insufficient
+  permissions, unknown reviewer, API error).
+- **Comment edits are ignored.** Editing an existing comment does not
+  re-trigger the workflow. Post a new comment with the corrected command.
+- **No effect on issues.** The workflow only runs on PR comments.
+- **No checkout, no exec.** The workflow only calls the GitHub REST API
+  with the default `GITHUB_TOKEN`. PR code is never checked out and never
+  executed, so there is no path for fork-supplied content to read or
+  exfiltrate the token.
+
+### Examples
+
+Self-service ready-for-review after fixing review feedback:
+
+```text
+/ready
+```
+
+Reviewer asks the author to address comments:
+
+```text
+/author
+```
+
+Multi-command (request a specific reviewer and mark ready in one comment):
+
+```text
+/request-review @somebody
+/ready
+```
+
+Inline prose around a command does not match - the command has to start the
+line:
+
+```text
+please /ready          # NOT matched (command not at line start)
+/ready                 # matched
+```
+
 ## Close Policy
 
 PRs may be closed if:
