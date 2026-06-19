@@ -366,3 +366,25 @@ opt-level = 3
 
 [profile.dev.package.iggy_common]
 opt-level = 3
+
+# Temporary test patch for apache/iggy#3507: idle io_uring rings are charged
+# as iowait and inflate /proc/pressure/io to ~100% with no real disk I/O.
+# Points every compio-* crate at the NO_IOWAIT fix in compio PR 957
+# (compio-rs/compio#957); that rev lives on the author's fork, which is why
+# the git url is hubcio/compio. All crates share one rev so the graph
+# resolves to a single instance of each. Do not merge - drop once the compio
+# fix ships to crates.io.
+[patch.crates-io]
+compio = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-buf = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-driver = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-executor = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-fs = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-io = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-log = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-macros = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-net = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-quic = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-runtime = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-tls = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
+compio-ws = { git = "https://github.com/hubcio/compio", rev = "55182653d09d850ec4efe29ab8d9a125442903a0" }
