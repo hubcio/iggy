@@ -43,39 +43,13 @@ enum WarningContext<'a> {
     ConnectorConfig(&'a str),
 }
 
-/// Environment variables starting with IGGY_ that are NOT config values.
-/// These are used for test control, CI, CLI behavior, config file paths, etc.
-const IGNORED_ENV_VARS: &[&str] = &[
-    "IGGY_CI_BUILD",
-    // Test-harness knob: overrides the default cluster size the integration
-    // harness builds; leaks to spawned servers via the IGGY_ env forwarding.
-    "IGGY_TEST_CLUSTER_NODES",
-    "IGGY_CONFIG_PATH",
-    "IGGY_CONNECTORS_CONFIG_PATH",
-    "IGGY_MCP_CONFIG_PATH",
-    "IGGY_ROOT_PASSWORD",
-    "IGGY_ROOT_USERNAME",
-    // Tunes per-shard io_uring SQ/CQ capacity; read directly by
-    // `server_common::executor::create_shard_executor` (see that fn for rationale).
-    "IGGY_SHARD_RUNTIME_CAPACITY",
-    "IGGY_TEST_CLEANUP_DISABLED",
-    "IGGY_TEST_VERBOSE",
-];
+/// `IGGY_` variables that are NOT config values: the config file paths the
+/// connectors runtime and the MCP server read before their config loads.
+const IGNORED_ENV_VARS: &[&str] = &["IGGY_CONNECTORS_CONFIG_PATH", "IGGY_MCP_CONFIG_PATH"];
 
 /// Prefixes for env vars handled by separate providers with runtime prefixes.
 /// The main config provider skips these; each sub-provider validates its own vars.
-///
-/// `IGGY_KAFKA_` (`gateways/kafka/src/main.rs`) parses its own nine vars by hand rather than via
-/// `#[derive(ConfigEnv)]`, so it needs an entry here the same way the connector prefixes do -
-/// without it, `iggy-server` (and `cargo test -p integration`, which forwards `IGGY_*` to spawned
-/// servers) `debug_assert!`s on the first `IGGY_KAFKA_*` var it sees. This trades away the
-/// typo-detection this provider gives derived configs: an `IGGY_KAFKA_` typo now silently no-ops
-/// instead of surfacing here.
-const DELEGATED_ENV_VAR_PREFIXES: &[&str] = &[
-    "IGGY_CONNECTORS_SINK_",
-    "IGGY_CONNECTORS_SOURCE_",
-    "IGGY_KAFKA_",
-];
+const DELEGATED_ENV_VAR_PREFIXES: &[&str] = &["IGGY_CONNECTORS_SINK_", "IGGY_CONNECTORS_SOURCE_"];
 
 type ProfileMap = FigmentMap<Profile, Dict>;
 
@@ -92,6 +66,7 @@ type ProfileMap = FigmentMap<Profile, Dict>;
 pub struct TypedEnvProvider<T: ConfigEnvMappings> {
     prefix: String,
     secret_keys: Vec<String>,
+    check_unknown_env_vars: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -105,6 +80,7 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
         Self {
             prefix: prefix.to_string(),
             secret_keys: secret_keys.iter().map(|s| s.to_string()).collect(),
+            check_unknown_env_vars: true,
             _phantom: PhantomData,
         }
     }
@@ -141,8 +117,18 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
         Self {
             prefix: prefix.to_string(),
             secret_keys,
+            check_unknown_env_vars: true,
             _phantom: PhantomData,
         }
+    }
+
+    /// Skip the unknown-variable scan in [`Self::deserialize`].
+    ///
+    /// For a loader that checks every name itself: a second check with its
+    /// own list would flag names that loader accepts.
+    pub fn without_unknown_env_var_check(mut self) -> Self {
+        self.check_unknown_env_vars = false;
+        self
     }
 
     /// Deserialize with runtime prefix prepended to each mapping's env_name.
@@ -157,10 +143,13 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
     /// Deserialize environment variables into a configuration profile map.
     ///
     /// This method:
-    /// 1. Validates that all env vars with the prefix are known (warns on unknown)
+    /// 1. Validates that all env vars with the prefix are known (warns on unknown),
+    ///    unless [`Self::without_unknown_env_var_check`] turned that off
     /// 2. Iterates over compile-time generated mappings and applies set values
     pub fn deserialize(&self) -> Result<ProfileMap, ConfigurationError> {
-        self.warn_unknown_env_vars_inner(WarningContext::MainConfig);
+        if self.check_unknown_env_vars {
+            self.warn_unknown_env_vars_inner(WarningContext::MainConfig);
+        }
         self.deserialize_inner(EnvNameResolution::Direct)
     }
 
