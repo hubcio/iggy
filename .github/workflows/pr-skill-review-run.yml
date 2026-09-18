@@ -1,0 +1,660 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Skill Review Run
+
+# Comment-driven code review. A committer comments `/skill <name>` on a pull
+# request and this workflow runs the repository skill
+# `.claude/skills/<name>/SKILL.md` (or `.agents/skills/<name>/SKILL.md`) with a
+# headless agent, then the second workflow posts the findings.
+#
+# Commands:
+#   /skill <name>   run the named skill against the PR head
+#   /skill          reply with the available skill names
+#
+# Two stages, split on the token boundary:
+#   run  (this file, issue_comment)  parse, gate, install the toolchain, run
+#                                    the agent, upload the run directory. The
+#                                    agent step holds no GitHub token.
+#   post (pr-skill-review-post.yml)  workflow_run with a write token, turns
+#                                    findings.json into one pull request
+#                                    review with inline comments.
+#
+# Gate: a repository write permission, read from the collaborator permission
+# endpoint, never a bot. A run costs DeepSeek tokens, CI minutes and executes
+# PR code with the DeepSeek key in the environment, so the gate is the
+# load-bearing control. author_association is not that control: on an org repo
+# it reports MEMBER for every org member, not only repo writers.
+#
+# SECURITY:
+# - PR code does execute here: cargo builds, skill scripts, and the agent run
+#   with --dangerously-skip-permissions on an ephemeral runner that holds the
+#   DeepSeek key. Keep that key scoped to the review bot and rotate it if a
+#   run is ever driven by someone you do not trust.
+# - The agent step receives no GitHub token. actions/checkout runs with
+#   persist-credentials: false, no token is exported into the step env, and
+#   every step after the agent (artifact upload) needs no token, so a
+#   compromised agent step has nothing to steal and nothing to write with.
+# - Skills, subagents, settings, the serena project file and the instruction
+#   files are taken from the base branch, never from the pull request under
+#   review. The checkout step deletes every copy the pull request carries and
+#   restores the base version where one exists, and the agent runs with
+#   --setting-sources user and --strict-mcp-config so that project settings and
+#   foreign MCP servers are never loaded at all.
+# - The control file that tells the poster where to answer is snapshotted into
+#   its own artifact before the agent step starts. The agent step runs pull
+#   request code as the same user, so it can rewrite that file, make it
+#   read-only, or leave a process that rewrites it later. Bytes that left the
+#   runner before the step cannot be changed after it, so the poster reads the
+#   snapshot and the review cannot move to another pull request.
+# - Nothing in this file posts. The start note that used to live here was
+#   removed after the run of 2026-09-18: an issue_comment run of this fork
+#   carries a read-only token, so the call answered 403 "Resource not
+#   accessible by integration" on every run.
+
+on:
+  issue_comment:
+    types: [created]
+
+# contents: read is everything this workflow needs, and it is all it gets: no
+# step here posts. An issue_comment run of a fork carries a read-only token
+# whatever this block asks for, which is why the answer on the pull request
+# comes from the poster workflow instead.
+permissions:
+  contents: read
+
+concurrency:
+  # One review per pull request at a time. Two different skills on the same PR
+  # queue instead of interleaving toolchain installs on the same runner pool.
+  group: pr-skill-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # Cheap prefilter: an ordinary comment never starts a runner. The real
+    # parse and the gate run in the first step, because a rejected command
+    # still has to reach the poster and get an answer.
+    if: |
+      github.event.issue.pull_request != null
+      && contains(github.event.comment.body, '/skill')
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Parse the command
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+          OUT_DIR: ${{ runner.temp }}/review-out
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+
+          # The comment body is untrusted text. It reaches this script through
+          # the environment, never interpolated into the script source, so
+          # shell metacharacters in it stay inert.
+          skill=""
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+              /skill)
+                skill="__usage__"
+                break
+                ;;
+              /skill[[:space:]]*)
+                rest="${line#/skill}"
+                # Word splitting is intended: the name is the first token. An
+                # empty remainder asks for the list, the same as a bare command,
+                # and a tab separates as well as a space.
+                # shellcheck disable=SC2086
+                set -- $rest
+                skill="${1:-__usage__}"
+                break
+                ;;
+            esac
+          done <<< "$COMMENT_BODY"
+
+          status=ok
+          if [ -z "$skill" ]; then
+            # The comment merely mentions the command. Stay silent.
+            status=no_command
+          elif [ "$skill" = "__usage__" ]; then
+            status=usage
+          elif ! printf '%s' "$skill" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+            status=bad_name
+          fi
+
+          # The association is a cheap prefilter, not the gate: on an org repo
+          # it says MEMBER for every org member. The permission endpoint is the
+          # accurate signal, and a lookup that fails denies rather than admits.
+          permission=""
+          allowed=0
+          case "$COMMENT_ASSOC" in
+            MEMBER|COLLABORATOR|OWNER)
+              # A bot cannot drive the command even when it carries a member assoc.
+              case "$COMMENT_AUTHOR" in
+                *'[bot]') ;;
+                *)
+                  permission="$(gh api \
+                    "repos/${REPO}/collaborators/${COMMENT_AUTHOR}/permission" \
+                    --jq '.permission' 2>/dev/null || true)"
+                  case "$permission" in
+                    write|admin) allowed=1 ;;
+                  esac
+                  ;;
+              esac
+              ;;
+          esac
+
+          # A run spends tokens and executes pull request code with the DeepSeek
+          # key in the environment, so the gate is settled before anything else
+          # and it outranks every other outcome except silence.
+          if [ "$status" != no_command ] && [ "$allowed" = 0 ]; then
+            status=denied
+          fi
+
+          # The skill must exist on the default branch. A name the base branch
+          # does not carry is refused here rather than after a ten minute
+          # toolchain install.
+          if [ "$status" = ok ]; then
+            if ! gh api "repos/${REPO}/contents/.claude/skills/${skill}/SKILL.md" >/dev/null 2>&1 \
+               && ! gh api "repos/${REPO}/contents/.agents/skills/${skill}/SKILL.md" >/dev/null 2>&1; then
+              status=unknown_skill
+            fi
+          fi
+
+          # Backs the /skill and unknown-skill replies. Both trees, because the
+          # repository keeps some skills in .agents and symlinks them.
+          {
+            gh api "repos/${REPO}/contents/.claude/skills" --jq '.[].name' 2>/dev/null || true
+            gh api "repos/${REPO}/contents/.agents/skills" --jq '.[].name' 2>/dev/null || true
+          } | sort -u | grep -v '^$' > "$OUT_DIR/skills.txt" || true
+
+          # The poster reads this file, and only these fields: the outcome, the
+          # name for the reply text, and the comment that asked. It carries no
+          # secret: the DeepSeek key never leaves the workflow env.
+          jq -n \
+            --arg status "$status" \
+            --arg skill "$skill" \
+            --arg comment_id "$COMMENT_ID" \
+            '{status: $status, skill: $skill, comment_id: $comment_id}' \
+            > "$OUT_DIR/request.json"
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "skill=$skill" >> "$GITHUB_OUTPUT"
+          echo "decision: status=${status} skill=${skill} author=${COMMENT_AUTHOR} assoc=${COMMENT_ASSOC} permission=${permission:-none} allowed=${allowed}"
+
+      # The base branch checkout comes first so that the composite action below
+      # is read from the base branch. A local action is resolved from the
+      # working tree, and the PR is not allowed to supply the toolchain setup.
+      - name: Check out the base branch
+        if: steps.parse.outputs.status == 'ok'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust
+        if: steps.parse.outputs.status == 'ok'
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          install-nextest: "true"
+          install-system-dependencies: "true"
+          # Read the cache the merge gate reads, and write none of it: this job
+          # compiles the pull request under review, so its target directory must
+          # not reach a later run.
+          save-cache: "false"
+          shared-key: "dev"
+
+      - name: Setup uv
+        if: steps.parse.outputs.status == 'ok'
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Setup Node
+        if: steps.parse.outputs.status == 'ok'
+        uses: actions/setup-node@v7
+
+      - name: Install the agent tooling
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          SIMPLE_ENGLISH_REPO: https://github.com/AminBlg/SimpleEnglish
+          SIMPLE_ENGLISH_SHA: 79b590fc8596523d92c26b1ea7e33236606ef069
+          CLAUDE_CODE_VERSION: 2.1.276
+        run: |
+          set -euo pipefail
+
+          # rtk: newest release, one static binary. It trims tool output before
+          # it reaches the model context, wired in through a PreToolUse hook.
+          curl -fsSL -o "$RUNNER_TEMP/rtk.tgz" \
+            "https://github.com/rtk-ai/rtk/releases/latest/download/rtk-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf "$RUNNER_TEMP/rtk.tgz" -C "$RUNNER_TEMP" rtk
+          sudo install -m 0755 "$RUNNER_TEMP/rtk" /usr/local/bin/rtk
+          rtk --version
+
+          # serena: semantic navigation, served to the agent over MCP. The
+          # package is serena-agent (the `serena` name in the install request
+          # makes uv refuse the source), and it ships the `serena` command. The
+          # pin is a release, not the git tip: the tip is rebuilt from source on
+          # every run and can change the reviewer without a commit here.
+          uv tool install "serena-agent==1.7.0"
+          serena --version
+          # serena drives rust-analyzer for Rust symbols. A toolchain without
+          # the component leaves the agent with ripgrep, which is a downgrade
+          # rather than a reason to abort the run.
+          rustup component add rust-analyzer \
+            || echo "warning: rust-analyzer is not available for this toolchain"
+
+          # Simple English plugin: sentence and vocabulary discipline for the
+          # posted comments. Pinned, because it loads into the reviewer as a
+          # plugin and can carry hooks of its own.
+          git clone --quiet "$SIMPLE_ENGLISH_REPO" "$RUNNER_TEMP/simple-english"
+          (
+            cd "$RUNNER_TEMP/simple-english"
+            git checkout --quiet --detach "$SIMPLE_ENGLISH_SHA"
+          )
+
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          # The npm global bin is not always on PATH on hosted runners, and
+          # $GITHUB_PATH only takes effect from the next step.
+          NPM_BIN="$(npm config get prefix)/bin"
+          echo "$NPM_BIN" >> "$GITHUB_PATH"
+          export PATH="$NPM_BIN:$PATH"
+          claude --version
+
+      - name: Write the agent configuration
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # The prompt and the comment style live on the base branch. Read them
+          # from there, not from the PR checkout that comes later.
+          for name in prompt comment-style; do
+            git show "origin/${BASE_BRANCH}:.github/review-bot/${name}.md" \
+              > "$RUNNER_TEMP/${name}.md"
+          done
+
+          # serena prints the system prompt its own documentation tells Claude
+          # Code users to run with. The MCP tool list alone does not stop the
+          # agent reaching for grep and sed on code.
+          serena prompts print-cc-system-prompt-override \
+            > "$RUNNER_TEMP/serena-override.md"
+          if [ ! -s "$RUNNER_TEMP/serena-override.md" ] \
+             || ! grep -q 'Serena' "$RUNNER_TEMP/serena-override.md"; then
+            echo "serena printed no usable system prompt override"
+            exit 1
+          fi
+
+          # Hooks. rtk rewrites Bash tool calls before they run, mirrored from
+          # the settings.json the maintainers use locally. serena-hooks fires
+          # on session start and after a run of grep or read calls, and each
+          # one names the symbolic tool that would have done the job.
+          #
+          # Every other knob is a plain environment variable on the agent step,
+          # CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS stays off: the review skills
+          # spawn workers through the Agent tool and state that they use no
+          # team messaging, so the flag would only add an untested path.
+          cat > "$RUNNER_TEMP/agent-settings.json" <<'JSON'
+          {
+            "hooks": {
+              "SessionStart": [
+                {
+                  "hooks": [
+                    {
+                      "type": "command",
+                      "command": "serena-hooks activate --client claude-code"
+                    }
+                  ]
+                }
+              ],
+              "PreToolUse": [
+                {
+                  "matcher": "Bash",
+                  "hooks": [
+                    { "type": "command", "command": "rtk hook claude" }
+                  ]
+                },
+                {
+                  "hooks": [
+                    {
+                      "type": "command",
+                      "command": "serena-hooks remind --client claude-code"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+          JSON
+
+          # --project-from-cwd makes serena index the checked out PR.
+          cat > "$RUNNER_TEMP/mcp.json" <<'JSON'
+          {
+            "mcpServers": {
+              "serena": {
+                "type": "stdio",
+                "command": "serena",
+                "args": ["start-mcp-server", "--context=claude-code", "--project-from-cwd"],
+                "env": {}
+              }
+            }
+          }
+          JSON
+
+      - name: Check out the pull request
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          OUT_DIR: ${{ runner.temp }}/review-out
+        run: |
+          set -euo pipefail
+          # Reads here are anonymous: the checkout dropped the credentials, and
+          # a public repository serves fetches without them.
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+          git fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          HEAD_REF="refs/remotes/pull/${PR_NUMBER}/head"
+          MERGE_BASE="$(git merge-base "origin/${BASE_BRANCH}" "$HEAD_REF")"
+
+          # The diff is taken before the trusted restore below so that it shows
+          # exactly what the PR proposes.
+          git diff --no-color "$MERGE_BASE" "$HEAD_REF" > "$RUNNER_TEMP/pr.diff"
+          git diff --no-color --stat "$MERGE_BASE" "$HEAD_REF" > "$RUNNER_TEMP/pr-stat.txt"
+          git diff --no-color --name-only "$MERGE_BASE" "$HEAD_REF" > "$RUNNER_TEMP/pr-files.txt"
+
+          git checkout --detach "$HEAD_REF"
+
+          # The revision the findings will describe. A push during the ten to
+          # thirty minutes that follow moves every line number of the diff, and
+          # the poster drops the anchors when the two shas disagree. The file is
+          # written through a temporary name, and the step below snapshots it
+          # before the agent starts.
+          REVIEWED_SHA="$(git rev-parse HEAD)"
+          jq --arg sha "$REVIEWED_SHA" '. + {reviewed_sha: $sha}' \
+            "$OUT_DIR/request.json" > "$OUT_DIR/request.json.new"
+          mv "$OUT_DIR/request.json.new" "$OUT_DIR/request.json"
+          echo "reviewed head: ${REVIEWED_SHA:0:9}"
+
+          # Skills, subagents, settings and the serena project file come from the
+          # base branch. The pull request is under review, so it does not get to
+          # define the reviewer. Serena reads .serena/project.yml from the
+          # checkout and renders it into the manual the agent starts from.
+          # Delete first: a checkout writes the paths the base branch carries,
+          # so a file the pull request added and the base does not have would
+          # survive a plain restore.
+          for dir in .claude .agents .serena; do
+            rm -rf "$dir"
+            git checkout "origin/${BASE_BRANCH}" -- "$dir" \
+              || echo "warning: ${dir} is not on ${BASE_BRANCH}"
+          done
+
+          # The instruction files, at any depth. The agent loads these as its
+          # own orders, so they come from the base branch too. No -type filter:
+          # this repository keeps CLAUDE.md as a symlink to AGENTS.md.
+          find . -path ./.git -prune -o \
+            \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md \) -print0 \
+            | xargs -0 -r rm -f
+          git ls-tree -r --name-only "origin/${BASE_BRANCH}" \
+            | grep -E '(^|/)(AGENTS|CLAUDE)\.md$' \
+            | while IFS= read -r path; do
+                git checkout "origin/${BASE_BRANCH}" -- "$path"
+              done
+
+          # A repository MCP config would hand the agent tool servers the pull
+          # request controls. --strict-mcp-config already ignores every config
+          # but the serena one passed on the command line, so the file only has
+          # to stop lying around in the tree the agent reads.
+          rm -f .mcp.json
+
+      # The control file names the pull request the poster answers on. The agent
+      # step below runs pull request code as the same user, so it can rewrite
+      # that file, make it read-only, or leave a process that rewrites it later.
+      # The snapshot is taken here, before that step, and the poster reads it
+      # instead of the working copy. Bytes that left the runner cannot change.
+      - name: Upload the control file
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: review-control
+          path: |
+            ${{ runner.temp }}/review-out/request.json
+            ${{ runner.temp }}/review-out/skills.txt
+          retention-days: 3
+          if-no-files-found: warn
+
+      # The agent holds no GitHub token, so what CI did on this commit reaches
+      # it as a file. A reviewer that knows the lanes already passed spends its
+      # test budget elsewhere.
+      - name: Collect the CI status
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          {
+            echo "CI status for the pull request head, read before this review ran."
+            echo "commit ${HEAD_SHA:0:9}"
+            echo
+            query_error="$(mktemp)"
+            checks="$(gh api \
+              "repos/${REPO}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+              --jq '.check_runs[] | "\(.conclusion // .status)\t\(.name)"' \
+              2>"$query_error" | sort || true)"
+            if [ -z "$checks" ]; then
+              echo "no check has run on this commit yet"
+              # An empty list and a failed query read the same to the agent, so
+              # the failure has to be visible here.
+              if [ -s "$query_error" ]; then
+                echo "the check-runs query reported:"
+                sed 's/^/  /' "$query_error"
+              fi
+            else
+              echo "checks by result:"
+              printf '%s\n' "$checks" | cut -f1 | uniq -c | sed 's/^ */  /'
+              echo
+              echo "checks that are not a success:"
+              printf '%s\n' "$checks" | grep -v '^success' | sed 's/\t/  /;s/^/  /' \
+                || echo "  none"
+            fi
+          } > "$RUNNER_TEMP/ci-status.txt"
+          cat "$RUNNER_TEMP/ci-status.txt"
+
+      - name: Run the review agent
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          # DeepSeek exposes an Anthropic-compatible endpoint, which is what
+          # the Claude Code CLI speaks. The [1m] suffix on a model name asks
+          # for the million token context variant.
+          ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.DEEPSEEK_AUTH_TOKEN }}
+          ANTHROPIC_MODEL: deepseek-flash[1m]
+          ANTHROPIC_DEFAULT_OPUS_MODEL: deepseek-flash[1m]
+          ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-flash[1m]
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-flash
+          CLAUDE_CODE_SUBAGENT_MODEL: deepseek-flash
+          CLAUDE_CODE_EFFORT_LEVEL: max
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "786432"
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
+          # The LSP tool gives the agent definitions and references through the
+          # rust-analyzer installed above.
+          ENABLE_LSP_TOOL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          SKILL: ${{ steps.parse.outputs.skill }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          OUT_DIR: ${{ runner.temp }}/review-out
+        run: |
+          set -euo pipefail
+
+          # No GitHub token reaches this step: not in the env, and the checkout
+          # above ran with persist-credentials: false. The agent cannot post.
+          sed \
+            -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
+            -e "s|{{REPO}}|${REPO}|g" \
+            -e "s|{{SKILL}}|${SKILL}|g" \
+            -e "s|{{BASE_BRANCH}}|${BASE_BRANCH}|g" \
+            -e "s|{{RUNNER_TEMP}}|${RUNNER_TEMP}|g" \
+            -e "s|{{OUT_DIR}}|${OUT_DIR}|g" \
+            "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/prompt.rendered.md"
+
+          # A placeholder with no substitution would reach the agent as literal
+          # braces, which is how a run once wrote its findings outside the
+          # artifact directory. Fail here instead.
+          if grep -q '{{' "$RUNNER_TEMP/prompt.rendered.md"; then
+            echo "unsubstituted placeholder in the prompt:"
+            grep -n '{{' "$RUNNER_TEMP/prompt.rendered.md" | head -5
+            exit 1
+          fi
+
+          # stream-json feeds the runner's live log through jq while the agent
+          # works, so a run in progress is readable in the Actions UI. The raw
+          # event stream goes to the artifact. stderr stays out of the pipe:
+          # one non-JSON line would break the filter.
+          #
+          # Two hours inside a 150 minute job: the upload steps still get to
+          # run when the agent hangs, and the poster then reports the timeout.
+          set +e
+          timeout --signal=TERM 7200 claude \
+            -p "$(cat "$RUNNER_TEMP/prompt.rendered.md")" \
+            --system-prompt "$(cat "$RUNNER_TEMP/serena-override.md")" \
+            --dangerously-skip-permissions \
+            --settings "$RUNNER_TEMP/agent-settings.json" \
+            --setting-sources user \
+            --mcp-config "$RUNNER_TEMP/mcp.json" \
+            --strict-mcp-config \
+            --plugin-dir "$RUNNER_TEMP/simple-english" \
+            --output-format stream-json --verbose \
+            2> "$OUT_DIR/agent-stderr.log" \
+          | tee "$OUT_DIR/agent-stream.jsonl" \
+          | jq --raw-input --unbuffered -r '
+              fromjson? // empty |
+              if .type == "assistant" then
+                (.message.content[]? |
+                  if .type == "text" then
+                    "say: " + (.text | gsub("\n"; " ") | .[0:160])
+                  elif .type == "tool_use" then
+                    "do:  " + .name + " " +
+                    ((.input.command // .input.file_path // .input.pattern // .input.prompt
+                      // "") | tostring | gsub("\n"; " ") | .[0:120])
+                  else empty end)
+              elif .type == "result" then
+                "end: " + (.subtype // "") + " cost_usd=" + ((.total_cost_usd // 0) | tostring) +
+                " turns=" + ((.num_turns // 0) | tostring)
+              else empty end'
+          rc=${PIPESTATUS[0]:-$?}
+          set -e
+          echo "agent exit code: ${rc}"
+          tail -n 20 "$OUT_DIR/agent-stderr.log" || true
+
+      - name: Check the findings file
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          OUT_DIR: ${{ runner.temp }}/review-out
+        run: |
+          set -euo pipefail
+          if [ ! -s "$OUT_DIR/findings.json" ]; then
+            echo "the agent produced no findings.json in ${OUT_DIR}"
+            # Name every JSON file the run left behind: a path mismatch is the
+            # likeliest cause and the log has to say where the file went.
+            echo "JSON files under ${RUNNER_TEMP}:"
+            find "$RUNNER_TEMP" -name '*.json' | head -20
+            exit 1
+          fi
+          jq -e '.findings | type == "array"' "$OUT_DIR/findings.json" >/dev/null \
+            || { echo "findings.json does not match the contract"; exit 1; }
+          echo "findings: $(jq '.findings | length' "$OUT_DIR/findings.json")"
+
+      - name: Report the cost
+        if: always() && steps.parse.outputs.status == 'ok'
+        env:
+          OUT_DIR: ${{ runner.temp }}/review-out
+        run: |
+          set -euo pipefail
+          python3 - "$OUT_DIR/agent-stream.jsonl" <<'PY'
+          import json
+          import sys
+
+          path = sys.argv[1]
+          usage = {}
+          cli_estimate = None
+          try:
+              with open(path, encoding="utf-8", errors="replace") as handle:
+                  for line in handle:
+                      line = line.strip()
+                      if not line.startswith("{"):
+                          continue
+                      try:
+                          event = json.loads(line)
+                      except ValueError:
+                          continue
+                      if event.get("type") == "result":
+                          usage = event.get("usage") or {}
+                          cli_estimate = event.get("total_cost_usd")
+          except FileNotFoundError:
+              print(f"cost: {path} is missing, nothing to price")
+              sys.exit(0)
+
+          if not usage:
+              print("cost: the stream carries no result record, nothing to price")
+              sys.exit(0)
+
+          tokens_in = usage.get("input_tokens", 0)
+          tokens_out = usage.get("output_tokens", 0)
+          cache_write = usage.get("cache_creation_input_tokens", 0)
+          cache_read = usage.get("cache_read_input_tokens", 0)
+          print("cost: tokens "
+                f"in={tokens_in} out={tokens_out} "
+                f"cache_write={cache_write} cache_read={cache_read}")
+
+          # Dollars per million tokens: input, output, cache write, cache read.
+          # DeepSeek has no separate cache write rate, so a write costs the
+          # cache miss rate. Cache read is their cache hit rate. Peak and
+          # off-peak both appear; off-peak is half. Claude rates are the
+          # published first-party ones, cache write at 1.25x input and cache
+          # read at 0.1x.
+          rates = {
+              "deepseek-flash peak": (0.30, 1.20, 0.30, 0.006),
+              "deepseek-flash off-peak": (0.15, 0.60, 0.15, 0.003),
+              "claude-sonnet-5": (2.00, 10.00, 2.50, 0.20),
+              "claude-opus-5": (5.00, 25.00, 6.25, 0.50),
+          }
+          for name, (price_in, price_out, price_write, price_read) in rates.items():
+              total = (tokens_in * price_in + tokens_out * price_out
+                       + cache_write * price_write + cache_read * price_read) / 1_000_000
+              print(f"cost: {name}: ${total:.4f}")
+          if cli_estimate is not None:
+              print(f"cost: claude code estimate: ${cli_estimate:.4f}")
+          PY
+
+      - name: Upload the run output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: review-out
+          path: ${{ runner.temp }}/review-out
+          retention-days: 3
+          if-no-files-found: warn
