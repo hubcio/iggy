@@ -501,7 +501,9 @@ mod tests {
     fn given_an_unknown_env_var_when_checking_then_only_debug_builds_should_refuse() {
         const PREFIX: &str = "IGGY_FILE_PROVIDER_TEST_";
         const UNKNOWN: &str = "IGGY_FILE_PROVIDER_TEST_UNKNOWN";
-        // SAFETY: single-threaded assertion over a variable no other test reads.
+        // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+        // against any concurrent environment access. `serial_test::serial` on
+        // this test is what prevents that.
         unsafe { std::env::set_var(UNKNOWN, "1") };
 
         let provider = FileConfigProvider::new(

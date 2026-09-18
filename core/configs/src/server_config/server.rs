@@ -522,19 +522,30 @@ mod tests {
     #[serial_test::serial]
     fn env_provider_accepts_server_process_env_vars() {
         for name in SERVER_PROCESS_ENV_VARS {
-            // SAFETY: serial test, and no concurrent test reads these variables.
+            // SAFETY: the race is process-wide, not per key: `set_var` is
+            // unsound against any concurrent environment access.
+            // `serial_test::serial` on this test is what prevents that.
             unsafe { env::set_var(name, "1") };
         }
 
-        let data = ServerConfigEnvProvider::default().data();
+        // The provider holds no scan of its own, so the typed provider's
+        // debug_assert! stays quiet. A panic here is the failure this test
+        // guards, and one of these names reaching the map is the other.
+        let data = ServerConfigEnvProvider::default()
+            .data()
+            .expect("the server env provider must accept every variable the server reads outside its config");
 
         for name in SERVER_PROCESS_ENV_VARS {
             // SAFETY: paired with the set above.
             unsafe { env::remove_var(name) };
         }
+
+        let profile = data
+            .get(&figment::Profile::default())
+            .expect("no default profile");
         assert!(
-            data.is_ok(),
-            "the server env provider must accept every variable the server reads outside its config"
+            profile.is_empty(),
+            "none of these variables is a config value, so none of them may reach the map: {profile:?}"
         );
     }
 }

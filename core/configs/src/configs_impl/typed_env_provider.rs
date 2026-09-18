@@ -43,9 +43,16 @@ enum WarningContext<'a> {
     ConnectorConfig(&'a str),
 }
 
-/// `IGGY_` variables that are NOT config values: the config file paths the
-/// connectors runtime and the MCP server read before their config loads.
-const IGNORED_ENV_VARS: &[&str] = &["IGGY_CONNECTORS_CONFIG_PATH", "IGGY_MCP_CONFIG_PATH"];
+/// `IGGY_` variables that are NOT config values: the paths the connectors
+/// runtime and the MCP server read before their config loads. A shared
+/// environment, or one `.env` that every binary loads, puts a sibling's path
+/// into this process, and neither of those two paths is a config value here.
+const IGNORED_ENV_VARS: &[&str] = &[
+    "IGGY_CONNECTORS_CONFIG_PATH",
+    "IGGY_CONNECTORS_ENV_PATH",
+    "IGGY_MCP_CONFIG_PATH",
+    "IGGY_MCP_ENV_PATH",
+];
 
 /// Prefixes for env vars handled by separate providers with runtime prefixes.
 /// The main config provider skips these; each sub-provider validates its own vars.
@@ -122,7 +129,8 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
         }
     }
 
-    /// Skip the unknown-variable scan in [`Self::deserialize`].
+    /// Skip the unknown-variable scan in [`Self::deserialize`] and
+    /// [`Self::deserialize_with_runtime_prefix`].
     ///
     /// For a loader that checks every name itself: a second check with its
     /// own list would flag names that loader accepts.
@@ -136,7 +144,9 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
     /// Unlike `deserialize()`, this method prepends `self.prefix` to each mapping's
     /// env_name, allowing for dynamic prefix construction at runtime.
     pub fn deserialize_with_runtime_prefix(&self) -> Result<ProfileMap, ConfigurationError> {
-        self.warn_unknown_env_vars_inner(WarningContext::ConnectorConfig(&self.prefix));
+        if self.check_unknown_env_vars {
+            self.warn_unknown_env_vars_inner(WarningContext::ConnectorConfig(&self.prefix));
+        }
         self.deserialize_inner(EnvNameResolution::PrependPrefix(&self.prefix))
     }
 
@@ -453,6 +463,25 @@ mod tests {
     struct NestedConfig {
         value: String,
         flag: bool,
+    }
+
+    /// A sibling binary's path variable arrives here through a shared
+    /// environment, or through one `.env` that every binary loads. Neither
+    /// path is a config value, and a debug build refuses to boot on an
+    /// unknown name, so the scan has to skip both pairs.
+    #[test]
+    fn given_a_sibling_binarys_path_when_scanning_then_should_not_flag_it() {
+        for name in [
+            "IGGY_CONNECTORS_CONFIG_PATH",
+            "IGGY_CONNECTORS_ENV_PATH",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_ENV_PATH",
+        ] {
+            assert!(
+                IGNORED_ENV_VARS.contains(&name),
+                "{name} is read by a sibling binary, so the scan must skip it"
+            );
+        }
     }
 
     #[test]
