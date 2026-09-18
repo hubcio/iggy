@@ -1,0 +1,421 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Skill Review Run
+
+# Comment-driven code review. A committer comments `/skill <name>` on a pull
+# request and this workflow runs the repository skill
+# `.claude/skills/<name>/SKILL.md` (or `.agents/skills/<name>/SKILL.md`) with a
+# headless agent, then the second workflow posts the findings.
+#
+# Commands:
+#   /skill <name>   run the named skill against the PR head
+#   /skill          reply with the available skill names
+#
+# Two stages, split on the token boundary:
+#   run  (this file, issue_comment)  parse, gate, install the toolchain, run
+#                                    the agent, upload the run directory. The
+#                                    agent step holds no GitHub token.
+#   post (pr-skill-review-post.yml)  workflow_run with a write token, turns
+#                                    findings.json into one pull request
+#                                    review with inline comments.
+#
+# Gate: MEMBER / COLLABORATOR / OWNER, never a bot. A run costs DeepSeek
+# tokens, CI minutes and executes PR code with the DeepSeek key in the
+# environment, so the gate is the load-bearing control.
+#
+# SECURITY:
+# - PR code does execute here: cargo builds, skill scripts, and the agent run
+#   with --dangerously-skip-permissions on an ephemeral runner that holds the
+#   DeepSeek key. Keep that key scoped to the review bot and rotate it if a
+#   run is ever driven by someone you do not trust.
+# - The agent step receives no GitHub token. actions/checkout runs with
+#   persist-credentials: false, no token is exported into the step env, and
+#   every step after the agent (artifact upload) needs no token, so a
+#   compromised agent step has nothing to steal and nothing to write with.
+# - `.claude` and `.agents` are restored from the base branch after the PR
+#   checkout, so a PR cannot redefine the skill that reviews it.
+# - The start ack is the only step holding a write token and it runs before
+#   the agent.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  # One review per pull request at a time. Two different skills on the same PR
+  # queue instead of interleaving toolchain installs on the same runner pool.
+  group: pr-skill-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # Cheap prefilter: an ordinary comment never starts a runner. The real
+    # parse and the gate run in the first step, because a rejected command
+    # still has to reach the poster and get an answer.
+    if: |
+      github.event.issue.pull_request != null
+      && contains(github.event.comment.body, '/skill')
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Parse the command
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          OUT_DIR: ${{ runner.temp }}/review-out
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+
+          # The comment body is untrusted text. It reaches this script through
+          # the environment, never interpolated into the script source, so
+          # shell metacharacters in it stay inert.
+          skill=""
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+              /skill)
+                skill="__usage__"
+                break
+                ;;
+              /skill\ *)
+                rest="${line#/skill}"
+                # Word splitting is intended: the name is the first token.
+                # shellcheck disable=SC2086
+                set -- $rest
+                skill="${1:-}"
+                break
+                ;;
+            esac
+          done <<< "$COMMENT_BODY"
+
+          status=ok
+          if [ -z "$skill" ]; then
+            # The comment merely mentions the command. Stay silent.
+            status=no_command
+          elif [ "$skill" = "__usage__" ]; then
+            status=usage
+          elif ! printf '%s' "$skill" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+            status=bad_name
+          fi
+
+          allowed=0
+          case "$COMMENT_ASSOC" in
+            MEMBER|COLLABORATOR|OWNER) allowed=1 ;;
+          esac
+          # A bot cannot drive the command even when it carries a member assoc.
+          case "$COMMENT_AUTHOR" in *'[bot]') allowed=0 ;; esac
+
+          # A run spends tokens and executes pull request code with the DeepSeek
+          # key in the environment, so the gate is settled before anything else
+          # and it outranks every other outcome except silence.
+          if [ "$status" != no_command ] && [ "$allowed" = 0 ]; then
+            status=denied
+          fi
+
+          # The skill must exist on the default branch. A name the base branch
+          # does not carry is refused here rather than after a ten minute
+          # toolchain install.
+          if [ "$status" = ok ]; then
+            if ! gh api "repos/${REPO}/contents/.claude/skills/${skill}/SKILL.md" >/dev/null 2>&1 \
+               && ! gh api "repos/${REPO}/contents/.agents/skills/${skill}/SKILL.md" >/dev/null 2>&1; then
+              status=unknown_skill
+            fi
+          fi
+
+          # Backs the /skill and unknown-skill replies. Both trees, because the
+          # repository keeps some skills in .agents and symlinks them.
+          {
+            gh api "repos/${REPO}/contents/.claude/skills" --jq '.[].name' 2>/dev/null || true
+            gh api "repos/${REPO}/contents/.agents/skills" --jq '.[].name' 2>/dev/null || true
+          } | sort -u | grep -v '^$' > "$OUT_DIR/skills.txt" || true
+
+          # The poster reads this file. It carries no secret: the DeepSeek key
+          # never leaves the workflow env.
+          jq -n \
+            --arg status "$status" \
+            --arg skill "$skill" \
+            --arg comment_id "$COMMENT_ID" \
+            --arg comment_author "$COMMENT_AUTHOR" \
+            --argjson pr "$PR_NUMBER" \
+            '{
+               status: $status,
+               skill: $skill,
+               pr: $pr,
+               comment_id: $comment_id,
+               comment_author: $comment_author
+             }' > "$OUT_DIR/request.json"
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "skill=$skill" >> "$GITHUB_OUTPUT"
+          echo "decision: status=${status} skill=${skill} author=${COMMENT_AUTHOR} assoc=${COMMENT_ASSOC} allowed=${allowed}"
+
+      - name: Post the start ack
+        if: steps.parse.outputs.status == 'ok'
+        continue-on-error: true
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+          SKILL: ${{ steps.parse.outputs.skill }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: `Review agent started for \`/skill ${process.env.SKILL}\`. ` +
+                'Findings arrive as a pull request review when the run finishes.',
+            });
+
+      # The base branch checkout comes first so that the composite action below
+      # is read from the base branch. A local action is resolved from the
+      # working tree, and the PR is not allowed to supply the toolchain setup.
+      - name: Check out the base branch
+        if: steps.parse.outputs.status == 'ok'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust
+        if: steps.parse.outputs.status == 'ok'
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          install-nextest: "true"
+          install-system-dependencies: "true"
+          save-cache: "true"
+          shared-key: "skill-review"
+
+      - name: Setup uv
+        if: steps.parse.outputs.status == 'ok'
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Setup Node
+        if: steps.parse.outputs.status == 'ok'
+        uses: actions/setup-node@v7
+
+      - name: Install the agent tooling
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          SIMPLE_ENGLISH_REPO: https://github.com/AminBlg/SimpleEnglish
+        run: |
+          set -euo pipefail
+
+          # rtk: newest release, one static binary. It trims tool output before
+          # it reaches the model context, wired in through a PreToolUse hook.
+          curl -fsSL -o "$RUNNER_TEMP/rtk.tgz" \
+            "https://github.com/rtk-ai/rtk/releases/latest/download/rtk-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf "$RUNNER_TEMP/rtk.tgz" -C "$RUNNER_TEMP" rtk
+          sudo install -m 0755 "$RUNNER_TEMP/rtk" /usr/local/bin/rtk
+          rtk --version
+
+          # serena: semantic navigation, served to the agent over MCP. The
+          # package is serena-agent (the `serena` name in the install request
+          # makes uv refuse the source), and it ships the `serena` command.
+          uv tool install --from git+https://github.com/oraios/serena serena-agent
+          serena --version
+          # serena drives rust-analyzer for Rust symbols. A toolchain without
+          # the component leaves the agent with ripgrep, which is a downgrade
+          # rather than a reason to abort the run.
+          rustup component add rust-analyzer \
+            || echo "warning: rust-analyzer is not available for this toolchain"
+
+          # Simple English plugin: sentence and vocabulary discipline for the
+          # posted comments.
+          git clone --depth 1 "$SIMPLE_ENGLISH_REPO" "$RUNNER_TEMP/simple-english"
+
+          npm install -g @anthropic-ai/claude-code
+          # The npm global bin is not always on PATH on hosted runners, and
+          # $GITHUB_PATH only takes effect from the next step.
+          NPM_BIN="$(npm config get prefix)/bin"
+          echo "$NPM_BIN" >> "$GITHUB_PATH"
+          export PATH="$NPM_BIN:$PATH"
+          claude --version
+
+      - name: Write the agent configuration
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # The prompt and the comment style live on the base branch. Read them
+          # from there, not from the PR checkout that comes later.
+          for name in prompt comment-style; do
+            git show "origin/${BASE_BRANCH}:.github/review-bot/${name}.md" \
+              > "$RUNNER_TEMP/${name}.md"
+          done
+
+          # rtk rewrites Bash tool calls before they run. Mirrors the
+          # settings.json hook the maintainers use locally.
+          #
+          # env: a findings file and a large diff need room beyond the default
+          # output cap, and the LSP tool gives the agent definitions and
+          # references through the rust-analyzer installed above.
+          # CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS stays off: the review skills
+          # spawn workers through the Agent tool and state that they use no
+          # team messaging, so the flag would only add an untested path.
+          cat > "$RUNNER_TEMP/agent-settings.json" <<'JSON'
+          {
+            "env": {
+              "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+              "ENABLE_LSP_TOOL": "1"
+            },
+            "hooks": {
+              "PreToolUse": [
+                {
+                  "matcher": "Bash",
+                  "hooks": [
+                    { "type": "command", "command": "rtk hook claude" }
+                  ]
+                }
+              ]
+            }
+          }
+          JSON
+
+          # --project-from-cwd makes serena index the checked out PR.
+          cat > "$RUNNER_TEMP/mcp.json" <<'JSON'
+          {
+            "mcpServers": {
+              "serena": {
+                "type": "stdio",
+                "command": "serena",
+                "args": ["start-mcp-server", "--context=claude-code", "--project-from-cwd"],
+                "env": {}
+              }
+            }
+          }
+          JSON
+
+      - name: Check out the pull request
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # Reads here are anonymous: the checkout dropped the credentials, and
+          # a public repository serves fetches without them.
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+          git fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          HEAD_REF="refs/remotes/pull/${PR_NUMBER}/head"
+          MERGE_BASE="$(git merge-base "origin/${BASE_BRANCH}" "$HEAD_REF")"
+
+          # The diff is taken before the trusted restore below so that it shows
+          # exactly what the PR proposes.
+          git diff --no-color "$MERGE_BASE" "$HEAD_REF" > "$RUNNER_TEMP/pr.diff"
+          git diff --no-color --stat "$MERGE_BASE" "$HEAD_REF" > "$RUNNER_TEMP/pr-stat.txt"
+          git diff --no-color --name-only "$MERGE_BASE" "$HEAD_REF" > "$RUNNER_TEMP/pr-files.txt"
+
+          git checkout --detach "$HEAD_REF"
+
+          # Skills, subagents and settings come from the base branch. The PR is
+          # under review, so it does not get to define the reviewer.
+          for dir in .claude .agents; do
+            rm -rf "$dir"
+            git checkout "origin/${BASE_BRANCH}" -- "$dir" \
+              || echo "warning: ${dir} is not on ${BASE_BRANCH}"
+          done
+
+      - name: Run the review agent
+        if: steps.parse.outputs.status == 'ok'
+        id: agent
+        env:
+          # DeepSeek exposes an Anthropic-compatible endpoint, which is what
+          # the Claude Code CLI speaks. The key goes under both names: DeepSeek
+          # documents ANTHROPIC_API_KEY, and Claude Code reads that one as
+          # x-api-key and ANTHROPIC_AUTH_TOKEN as a bearer header.
+          ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+          ANTHROPIC_API_KEY: ${{ secrets.DEEPSEEK_AUTH_TOKEN }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.DEEPSEEK_AUTH_TOKEN }}
+          ANTHROPIC_MODEL: deepseek-flash
+          ANTHROPIC_SMALL_FAST_MODEL: deepseek-flash
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-flash
+          ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-flash
+          # The review skills ask for a stronger model for their clean-room
+          # validation passes, which is the one place the extra cost buys
+          # accuracy. Roughly four times the price of flash.
+          ANTHROPIC_DEFAULT_OPUS_MODEL: deepseek-v4-pro
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          SKILL: ${{ steps.parse.outputs.skill }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          OUT_DIR: ${{ runner.temp }}/review-out
+        run: |
+          set -euo pipefail
+
+          # No GitHub token reaches this step: not in the env, and the checkout
+          # above ran with persist-credentials: false. The agent cannot post.
+          sed \
+            -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
+            -e "s|{{REPO}}|${REPO}|g" \
+            -e "s|{{SKILL}}|${SKILL}|g" \
+            -e "s|{{BASE_BRANCH}}|${BASE_BRANCH}|g" \
+            -e "s|{{RUNNER_TEMP}}|${RUNNER_TEMP}|g" \
+            "$RUNNER_TEMP/prompt.md" > "$RUNNER_TEMP/prompt.rendered.md"
+
+          # Two hours inside a 150 minute job: the upload steps still get to
+          # run when the agent hangs, and the poster then reports the timeout.
+          set +e
+          timeout --signal=TERM 7200 claude \
+            -p "$(cat "$RUNNER_TEMP/prompt.rendered.md")" \
+            --dangerously-skip-permissions \
+            --settings "$RUNNER_TEMP/agent-settings.json" \
+            --mcp-config "$RUNNER_TEMP/mcp.json" \
+            --plugin-dir "$RUNNER_TEMP/simple-english" \
+            --output-format json \
+            > "$OUT_DIR/agent-output.json" 2> "$OUT_DIR/agent-stderr.log"
+          rc=$?
+          set -e
+          echo "agent exit code: ${rc}"
+          tail -n 20 "$OUT_DIR/agent-stderr.log" || true
+
+      - name: Check the findings file
+        if: steps.parse.outputs.status == 'ok'
+        env:
+          OUT_DIR: ${{ runner.temp }}/review-out
+        run: |
+          set -euo pipefail
+          test -s "$OUT_DIR/findings.json" \
+            || { echo "the agent produced no findings.json"; exit 1; }
+          jq -e '.findings | type == "array"' "$OUT_DIR/findings.json" >/dev/null \
+            || { echo "findings.json does not match the contract"; exit 1; }
+          echo "findings: $(jq '.findings | length' "$OUT_DIR/findings.json")"
+
+      - name: Upload the run output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: review-out
+          path: ${{ runner.temp }}/review-out
+          retention-days: 3
+          if-no-files-found: warn

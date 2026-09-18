@@ -1,0 +1,316 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Skill Review Post
+
+# Second stage of the /skill review command. Reads the artifact that
+# pr-skill-review-run.yml uploaded and turns findings.json into one pull
+# request review with inline comments.
+#
+# Why a separate workflow: the agent runs arbitrary PR code, so it never holds
+# a write token. This workflow fires through workflow_run, which runs against
+# the default branch with the permissions below, and it executes no PR code.
+#
+# Outcome rules:
+#   denied / usage / unknown skill  -> reply on the pull request, confused face
+#   ok, agent produced no findings  -> reply naming the run and its conclusion
+#   ok, findings present            -> one review (event COMMENT) with inline
+#                                      comments, +1 on the trigger comment
+#
+# Anchoring: GitHub accepts an inline comment only on a line that the diff
+# carries, and a single createReview call keeps only the first 30 inline
+# comments, dropping the rest without an error. Findings outside a diff hunk,
+# and findings past the cap, move into the review body.
+
+on:
+  workflow_run:
+    workflows: ["PR Skill Review Run"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+  # Required to fetch the review-out artifact from the run above.
+  actions: read
+
+concurrency:
+  # The pull request number is not known until the artifact is parsed, so the
+  # upstream run id keys the group. Each run is unique, which is what the run
+  # after one review command needs.
+  group: pr-skill-review-post-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  post:
+    if: |
+      github.event.workflow_run.conclusion == 'success'
+      || github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download the run output
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: review-out
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: out/
+
+      - name: Post the outcome
+        uses: actions/github-script@v9
+        env:
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const REQUEST_PATH = 'out/request.json';
+            // A run that died before its first step leaves no artifact and no
+            // pull request number to answer on. The red run is the signal.
+            if (!fs.existsSync(REQUEST_PATH)) {
+              core.warning('no review-out artifact: the run failed before it ' +
+                'produced one, nothing to post');
+              return;
+            }
+
+            const request = JSON.parse(fs.readFileSync(REQUEST_PATH, 'utf8'));
+            const prNumber = Number(request.pr);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed(`invalid pr number: ${request.pr}`);
+              return;
+            }
+
+            const withRetry = async (fn, label) => {
+              const delays = [500, 1500, 4000];
+              for (let attempt = 0; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (e) {
+                  const s = e.status;
+                  const transient = s === undefined || s === 429
+                                 || (s >= 500 && s < 600);
+                  if (!transient || attempt >= delays.length) throw e;
+                  core.warning(`${label}: transient failure ` +
+                    `(${s ?? e.code ?? 'network'}), retry ` +
+                    `${attempt + 1}/${delays.length}`);
+                  await new Promise((r) => setTimeout(r, delays[attempt]));
+                }
+              }
+            };
+
+            const commentId = Number(request.comment_id) || null;
+            const react = async (content) => {
+              if (!commentId) return;
+              try {
+                await withRetry(() => github.rest.reactions.createForIssueComment({
+                  owner, repo, comment_id: commentId, content,
+                }), `react ${content}`);
+              } catch (e) {
+                core.warning(`reaction ${content} failed: ${e.message}`);
+              }
+            };
+            const reply = async (text) => {
+              try {
+                await withRetry(() => github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber, body: text,
+                }), 'createComment');
+              } catch (e) {
+                core.warning(`reply failed: ${e.message}`);
+              }
+            };
+            const skills = () => {
+              try {
+                return fs.readFileSync('out/skills.txt', 'utf8')
+                  .split('\n').map((s) => s.trim()).filter(Boolean);
+              } catch {
+                return [];
+              }
+            };
+            const available = () => {
+              const names = skills();
+              return names.length
+                ? names.map((n) => `\`${n}\``).join(', ')
+                : 'none';
+            };
+
+            // A comment that mentions the command without using it gets no
+            // answer: it is not a request for a review.
+            if (request.status === 'no_command') {
+              core.info('the comment mentions /skill without using it');
+              return;
+            }
+
+            if (request.status !== 'ok') {
+              const reasons = {
+                denied: '`/skill` is limited to repository committers, and ' +
+                  `\`${request.comment_author}\` does not have write access.`,
+                usage: `\`/skill\` needs a skill name. Available here: ${available()}.`,
+                unknown_skill: `No skill named \`${request.skill}\` on the ` +
+                  `default branch. Available here: ${available()}.`,
+                bad_name: `\`${request.skill}\` is not a valid skill name.`,
+              };
+              await react('confused');
+              await reply(reasons[request.status]
+                || `The command was rejected (${request.status}).`);
+              return;
+            }
+
+            const FINDINGS_PATH = 'out/findings.json';
+            if (!fs.existsSync(FINDINGS_PATH)) {
+              await react('confused');
+              await reply('The review run ended with ' +
+                `\`${process.env.CONCLUSION}\` and produced no findings. ` +
+                `[Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+
+            let payload;
+            try {
+              payload = JSON.parse(fs.readFileSync(FINDINGS_PATH, 'utf8'));
+            } catch (e) {
+              await react('confused');
+              await reply('The findings file is not valid JSON. ' +
+                `[Run log](${process.env.RUN_URL}).`);
+              return;
+            }
+            const findings = Array.isArray(payload.findings)
+              ? payload.findings
+              : [];
+
+            let pr;
+            try {
+              pr = await withRetry(() => github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              }), 'pulls.get');
+            } catch (e) {
+              if (e.status === 404) {
+                core.info('pull request not found, skipping');
+                return;
+              }
+              throw e;
+            }
+            // Reviews land on open pull requests only; a closed one would 422.
+            if (pr.data.state !== 'open') {
+              core.info(`pull request state is ${pr.data.state}, skipping`);
+              return;
+            }
+
+            // New-side line ranges of every file the diff touches. A comment
+            // outside them is rejected by the API, so it becomes body text.
+            const files = await withRetry(() => github.paginate(
+              github.rest.pulls.listFiles,
+              { owner, repo, pull_number: prNumber, per_page: 100 },
+            ), 'listFiles');
+            const ranges = new Map();
+            for (const file of files) {
+              const list = [];
+              const hunks = (file.patch || '')
+                .matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm);
+              for (const match of hunks) {
+                const start = Number(match[1]);
+                const count = match[2] === undefined ? 1 : Number(match[2]);
+                if (count > 0) list.push([start, start + count - 1]);
+              }
+              ranges.set(file.filename, list);
+            }
+
+            const SEVERITIES = new Set(
+              ['critical', 'warning', 'nit', 'simplification']);
+            const inline = [];
+            const loose = [];
+            const seen = new Set();
+
+            for (const finding of findings) {
+              // The prompt asks for the text without a prefix. Strip one when
+              // the model added it anyway, so the severity never doubles.
+              const body = String(finding.body || '').trim()
+                .replace(/^(critical|warning|nit|simplification):\s*/i, '');
+              if (!body) continue;
+
+              const path = String(finding.path || '').replace(/^\.\//, '');
+              // Number(null) is 0, so null, a missing line and a NaN all have
+              // to fall out here rather than reach the anchor test.
+              const parsed = Number(finding.line);
+              const line = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+              const severity = SEVERITIES.has(String(finding.severity).toLowerCase())
+                ? String(finding.severity).toLowerCase()
+                : '';
+              const text = severity ? `${severity}: ${body}` : body;
+
+              const key = `${path}:${line}:${text}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+
+              const hunks = ranges.get(path) || [];
+              const anchored = line !== null
+                && hunks.some(([start, end]) => line >= start && line <= end);
+              if (anchored) {
+                inline.push({ path, line, body: text });
+              } else {
+                loose.push({ path, line, text });
+              }
+            }
+
+            // One createReview call keeps the first 30 inline comments and
+            // drops the rest silently, so the overflow joins the body findings.
+            const MAX_INLINE = 30;
+            const overflow = inline
+              .splice(MAX_INLINE)
+              .map((c) => ({ path: c.path, line: c.line, text: c.body }));
+
+            const parts = [];
+            const summary = String(payload.summary || '').trim();
+            if (summary) parts.push(summary);
+            const unanchored = [...loose, ...overflow];
+            if (unanchored.length) {
+              parts.push('', 'Findings without an anchor on a changed line:');
+              for (const item of unanchored) {
+                const where = item.line === null
+                  ? `\`${item.path}\``
+                  : `\`${item.path}:${item.line}\``;
+                parts.push(`- ${where} ${item.text}`);
+              }
+            }
+
+            if (!inline.length && !parts.length) {
+              await react('+1');
+              await reply('The review run finished with no findings.');
+              return;
+            }
+
+            const params = {
+              owner,
+              repo,
+              pull_number: prNumber,
+              commit_id: pr.data.head.sha,
+              event: 'COMMENT',
+              body: parts.join('\n').trim(),
+            };
+            if (inline.length) params.comments = inline;
+            await withRetry(
+              () => github.rest.pulls.createReview(params),
+              'createReview',
+            );
+            core.info(`posted ${inline.length} inline comments and ` +
+              `${unanchored.length} body findings`);
+            await react('+1');
