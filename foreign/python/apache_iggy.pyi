@@ -3651,6 +3651,6 @@ class UserStatus(enum.Enum):
     The user account is inactive and cannot be used.
     """
 
-class Durability(str, enum.Enum):
+class Durability(str, enum.Enum):  # noqa: UP042
     REPLICATED = "replicated"
     PERSISTED = "persisted"
