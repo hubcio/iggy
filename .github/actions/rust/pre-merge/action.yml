@@ -181,6 +181,56 @@ runs:
       with:
         restore: "false"
 
+    # rust-cache cannot reuse workspace crates: checkout resets their mtimes, so
+    # Cargo rebuilds them all. sccache keys on content instead, and its directory
+    # travels between runs as a stash artifact. Like planning, it is an
+    # optimization: an install or stash failure falls back to a plain build.
+    - name: Install sccache
+      id: sccache-install
+      if: inputs.task == 'test-build'
+      continue-on-error: true
+      uses: taiki-e/install-action@v2
+      with:
+        tool: sccache@0.18.0
+
+    - name: Enable sccache for workspace crates
+      id: sccache
+      if: steps.sccache-install.outcome == 'success'
+      env:
+        # Bounds the stash every run downloads and uploads.
+        SCCACHE_CACHE_SIZE: 5G
+        STASH_TASK: ${{ inputs.task }}
+      run: |
+        set -euo pipefail
+        sccache_dir="$RUNNER_TEMP/sccache"
+        # A toolchain bump invalidates every entry, so it starts a fresh stash
+        # instead of downloading a dead one.
+        rust_release=$(rustc -vV | sed -n 's/^release: //p')
+        {
+          echo "SCCACHE_DIR=$sccache_dir"
+          echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+          # One server for the whole job, so the stats cover every cargo call.
+          echo "SCCACHE_IDLE_TIMEOUT=0"
+          # A dead server degrades to plain rustc instead of failing the build.
+          echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+          # Dependencies already come from rust-cache. cargo-llvm-cov owns
+          # RUSTC_WRAPPER and forwards workspace crates to this wrapper.
+          echo "RUSTC_WORKSPACE_WRAPPER=sccache"
+        } >> "$GITHUB_ENV"
+        {
+          echo "dir=$sccache_dir"
+          echo "key=sccache-${STASH_TASK}-rust-${rust_release}"
+        } >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Restore sccache stash
+      if: steps.sccache.outcome == 'success'
+      continue-on-error: true
+      uses: apache/infrastructure-actions/stash/restore@c968777141a2afc98d1a09c9f6979455bfebaae3 # restore/v1.0.1
+      with:
+        key: ${{ steps.sccache.outputs.key }}
+        path: ${{ steps.sccache.outputs.dir }}
+
     - name: Build coverage artifacts
       if: inputs.task == 'runtime' || inputs.task == 'test-build'
       env:
@@ -348,6 +398,34 @@ runs:
           --archive-file "$ARTIFACT_DIR/nextest.tar.zst"
       shell: bash
 
+    - name: Report sccache stats
+      if: always() && steps.sccache.outcome == 'success'
+      continue-on-error: true
+      run: |
+        set -euo pipefail
+        stats=$(sccache --show-stats)
+        printf '%s\n' "$stats"
+        {
+          echo "### sccache"
+          echo '```text'
+          printf '%s\n' "$stats"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        # Stopping the server flushes pending cache writes before the upload.
+        sccache --stop-server > /dev/null
+        du -sh "$SCCACHE_DIR"
+      shell: bash
+
+    - name: Save sccache stash
+      if: success() && steps.sccache.outcome == 'success'
+      continue-on-error: true
+      uses: apache/infrastructure-actions/stash/save@f1a487181effd0b216892001abdfb524442bb24d # save/v1.0.1
+      with:
+        key: ${{ steps.sccache.outputs.key }}
+        path: ${{ steps.sccache.outputs.dir }}
+        # sccache entries are already compressed.
+        compression-level: 0
+
     - name: Run coverage test partition
       if: inputs.task == 'test'
       env:
@@ -428,12 +506,23 @@ runs:
         tar --zstd -xf "$ARTIFACT_DIR/nextest.tar.zst"
         tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
         ./scripts/ci/restore-runtime.sh "$RUNNER_TEMP/rust-runtime"
+        echo "Disk space before tests:"
+        df -h /
+        # The after-test report must survive a failing run: a full disk is one
+        # way to fail.
+        nextest_status=0
+        # slice deals the filtered test list round-robin, so neighbouring slow
+        # tests such as the per-transport variants of one scenario land on
+        # different shards. hash placement can stack them on one shard.
         cargo nextest run \
           --cargo-metadata target/nextest/cargo-metadata.json \
           --binaries-metadata target/nextest/binaries-metadata.json \
           --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
           --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
-          --partition "hash:${PARTITION_INDEX}/${PARTITION_COUNT}"
+          --partition "slice:${PARTITION_INDEX}/${PARTITION_COUNT}" || nextest_status=$?
+        echo "Disk space after tests:"
+        df -h /
+        exit "$nextest_status"
       shell: bash
 
     # Compare the shared HEAD runtime with a separately built baseline server.

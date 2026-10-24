@@ -61,6 +61,9 @@ jobs:
     with:
       task: runtime
       timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
 
   rust-test-build:
     name: Rust test artifacts
@@ -70,6 +73,9 @@ jobs:
     with:
       task: test-build
       timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
 
   # Rust components
   test-rust:

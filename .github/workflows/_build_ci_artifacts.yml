@@ -38,6 +38,8 @@ on:
 
 permissions:
   contents: read
+  # The sccache stash restore lists artifacts from earlier runs.
+  actions: read
 
 env:
   IGGY_CI_BUILD: ${{ inputs.build-metadata }}

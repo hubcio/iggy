@@ -88,6 +88,9 @@ jobs:
       task: runtime
       save-cache: true
       build-metadata: true
+    permissions:
+      contents: read
+      actions: read
 
   rust-test-build:
     name: Rust test artifacts
@@ -99,6 +102,9 @@ jobs:
       test-scope: workspace
       save-cache: true
       build-metadata: true
+    permissions:
+      contents: read
+      actions: read
 
   rust-coverage:
     name: Rust
