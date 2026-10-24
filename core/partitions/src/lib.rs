@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// sccache PoC: source change that invalidates partitions and its dependents.
 #![allow(clippy::future_not_send)]
 
 mod consumer_offset_capacity;
