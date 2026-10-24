@@ -1,0 +1,55 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Temporary harness: runs only the Rust build and test shards, so the shard
+# layout, disk usage, and fixture generation measurements skip the full
+# pre-merge regression that .github changes trigger. Delete before the PR.
+
+name: Rust test shards trial
+on:
+  push:
+    branches: [ci/rust-test-shards]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Reads the warm rust-cache that fork master already holds, like a PR does.
+jobs:
+  runtime:
+    name: Runtime binaries
+    uses: ./.github/workflows/_build_ci_artifacts.yml
+    with:
+      task: runtime
+      timeout-minutes: 60
+
+  rust-test-build:
+    name: Rust test artifacts
+    uses: ./.github/workflows/_build_ci_artifacts.yml
+    with:
+      task: test-build
+      test-scope: workspace
+      timeout-minutes: 60
+
+  rust-tests:
+    name: Rust tests
+    needs: [runtime, rust-test-build]
+    uses: ./.github/workflows/_rust_tests.yml
