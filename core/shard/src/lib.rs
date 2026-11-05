@@ -7416,7 +7416,7 @@ where
         }
         // Repair replies do not replace history. complete_repair waits for
         // file results; fencing live prepares here would create another gap.
-        let Some(session) = partition.repair else {
+        let Some(session) = partition.repair.as_deref().copied() else {
             return;
         };
         if (header.replica, header.nonce) != (session.peer, session.nonce) {
@@ -9732,7 +9732,7 @@ where
                 // two ingest sites, so the arming side and the ingest side cannot
                 // drift apart.
                 let session_live = consensus::repair_session_live(partition.consensus());
-                let repair_finished = partition.repair.is_some_and(|session| {
+                let repair_finished = partition.repair.as_deref().is_some_and(|session| {
                     if !session_live || consensus_view != session.view {
                         return true;
                     }
@@ -11358,18 +11358,20 @@ where
         partition.restart_repair_budget();
         let nonce = iggy_common::random_id::get_uuid();
         let armed = partition.transfer.is_none();
-        partition.transfer = Some(partitions::state_transfer::PartitionTransferSession {
-            nonce,
-            peer,
-            commit_op: 0,
-            artifacts: Vec::new(),
-            target_accepted: false,
-            idle_ticks: 0,
-            spill: None,
-            scan: None,
-            seed: None,
-            pulled_len: 0,
-        });
+        partition.transfer = Some(Box::new(
+            partitions::state_transfer::PartitionTransferSession {
+                nonce,
+                peer,
+                commit_op: 0,
+                artifacts: Vec::new(),
+                target_accepted: false,
+                idle_ticks: 0,
+                spill: None,
+                scan: None,
+                seed: None,
+                pulled_len: 0,
+            },
+        ));
         self.send_request_state_transfer(partition.consensus(), peer, nonce)
             .await;
         armed
@@ -11508,7 +11510,7 @@ where
         partition.gap_ticks.set(0);
         self.partition_repairs_inflight
             .set(self.partition_repairs_inflight.get() + 1);
-        partition.repair = Some(partitions::RepairSession {
+        partition.repair = Some(Box::new(partitions::RepairSession {
             nonce,
             view: consensus.view(),
             from_op,
@@ -11519,7 +11521,7 @@ where
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(from_op),
-        });
+        }));
         tracing::info!(
             shard = self.id,
             namespace_raw = partition.consensus().group(),
@@ -11683,7 +11685,7 @@ where
         let view = consensus.view();
         self.partition_repairs_inflight
             .set(self.partition_repairs_inflight.get() + 1);
-        partition.repair = Some(partitions::RepairSession {
+        partition.repair = Some(Box::new(partitions::RepairSession {
             nonce,
             view,
             from_op,
@@ -11697,7 +11699,7 @@ where
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(from_op),
-        });
+        }));
         tracing::info!(
             shard = self.id,
             namespace_raw = namespace,
