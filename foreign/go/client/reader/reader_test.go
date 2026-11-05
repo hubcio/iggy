@@ -436,6 +436,71 @@ func TestPartitionReader_ReadsEachGroupWithOneRequestAndContinuesAfterItsLastMes
 	assert.Equal(t, uint64(7), again.targets[0].Strategy.Value, "a partition continues after its last message")
 }
 
+func TestPartitionReader_DrainsABusyPrimaryWhileOtherPrimariesWaitWithinTheEffectivePrefetch(t *testing.T) {
+	const minimumSlots = 32
+	for _, budget := range []struct {
+		name            string
+		primaries       int
+		prefetchBatches uint32
+	}{
+		{"one_batch_three_primaries", 3, 1},
+		{"minimum_prefetch", minimumSlots, 1},
+		{"larger_prefetch", minimumSlots + 1, minimumSlots + 1},
+	} {
+		for _, commit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/on_read_%t", budget.name, commit), func(t *testing.T) {
+				client := newFakeClient()
+				client.grouper = func(partitions []uint32) [][]uint32 {
+					groups := make([][]uint32, 0, len(partitions))
+					for _, partition := range partitions {
+						groups = append(groups, []uint32{partition})
+					}
+					return groups
+				}
+				partitions := make([]uint32, budget.primaries)
+				for index := range partitions {
+					partitions[index] = uint32(index + 1)
+				}
+				client.assignments <- partitions
+				options := waitOneSecond
+				if commit {
+					options.Commit = iggcon.OnReadCommit()
+				}
+				reader, err := NewPartitionReader(context.Background(), client, identifier(t, 1), identifier(t, 2),
+					iggcon.NewGroupConsumer(identifier(t, 9)), WithPollOptions(options),
+					WithPrefetchMessages(budget.prefetchBatches*options.Count), WithRetryInterval(testRetryInterval))
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = reader.Close(context.Background()) })
+				polled := nextInBackground(reader)
+				reads := make(map[uint32]*fakeRead, budget.primaries)
+				for range budget.primaries {
+					read := client.nextRead(t)
+					require.Len(t, read.targets, 1)
+					assert.Equal(t, commit, read.commit)
+					reads[read.targets[0].PartitionId] = read
+				}
+				require.Len(t, reads, budget.primaries, "every idle primary waits concurrently before any reply")
+
+				const busyPartition = uint32(2)
+				const lastOffset = uint64(2)
+				busy := reads[busyPartition]
+				for offset := uint64(0); offset <= lastOffset; offset++ {
+					busy.answer(ahead(busyPartition, lastOffset, offset))
+					result := <-polled
+					require.NoError(t, result.err)
+					assert.Equal(t, []uint64{offset}, offsets(result.polled))
+					if offset < lastOffset {
+						polled = nextInBackground(reader)
+						busy = client.nextRead(t)
+						assert.Equal(t, []uint32{busyPartition}, partitionsOf(busy), "quiet primaries keep their pending reads")
+						assert.Equal(t, commit, busy.commit)
+					}
+				}
+			})
+		}
+	}
+}
+
 // Under OnRead a read stores its offset, so the reader reads only for a waiting
 // Next. After a lost reply the next read starts after what the lost read
 // stored, and the reader reads those messages again without a store.
@@ -1320,19 +1385,33 @@ func TestPartitionReader_ReadsEachBackloggedPartitionOfAGroupInItsOwnRead(t *tes
 // More backlogged partitions than free slots are dealt over the slots, least
 // recently served first.
 func TestPartitionReader_DealsMoreBackloggedPartitionsThanFreeSlotsOverTheSlots(t *testing.T) {
+	const slots = 32
 	client := newFakeClient()
+	partitions := make([]uint32, slots+1)
+	sections := []iggcon.FetchMessagesSection{ahead(1, 100, 0)}
+	for index := range partitions {
+		partitions[index] = uint32(index + 1)
+		if index > 0 {
+			sections = append(sections, behind(partitions[index], 50))
+		}
+	}
 	reader, err := NewPartitionReader(context.Background(), client, identifier(t, 1), identifier(t, 2),
-		iggcon.NewSingleConsumer(identifier(t, 3)), WithPartitions(1, 2, 3, 4), WithPollOptions(waitOneSecond),
-		WithPrefetchMessages(3*waitOneSecond.Count), WithRetryInterval(testRetryInterval))
+		iggcon.NewSingleConsumer(identifier(t, 3)), WithPartitions(partitions...), WithPollOptions(waitOneSecond),
+		WithPrefetchMessages(slots*waitOneSecond.Count), WithRetryInterval(testRetryInterval))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reader.Close(context.Background()) })
-	ahead := section(1, 0)
-	ahead.CurrentOffset = 100
 
-	client.nextRead(t).answer(ahead, behind(2, 50), behind(3, 50), behind(4, 50))
+	client.nextRead(t).answer(sections...)
 
-	reads := [][]uint32{partitionsOf(client.nextRead(t)), partitionsOf(client.nextRead(t))}
-	assert.ElementsMatch(t, [][]uint32{{2, 4}, {1, 3}}, reads, "the queued batch holds one of three slots")
+	reads := make([][]uint32, 0, slots-1)
+	for range slots - 1 {
+		reads = append(reads, partitionsOf(client.nextRead(t)))
+	}
+	expected := [][]uint32{{2, slots + 1}, {1, 3}}
+	for partition := uint32(4); partition <= slots; partition++ {
+		expected = append(expected, []uint32{partition})
+	}
+	assert.ElementsMatch(t, expected, reads, "the queued batch holds one slot, and the last served partition goes last")
 	assert.True(t, client.readsNothingFor(300*time.Millisecond))
 }
 

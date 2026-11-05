@@ -380,6 +380,79 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    @Test(arguments: [false, true])
+    func thirtyTwoPrimariesWaitConcurrentlyWhileOneDrains(onRead: Bool) async throws {
+        let primaryCount = 32
+        let partitions = (1...primaryCount).map(UInt32.init)
+        let topic = FakeTopic(ends: [:], reportsHead: true)
+        var started: [FakeVSRServer] = []
+        for _ in partitions {
+            started.append(try await FakeVSRServer.started())
+        }
+        let primaries = started
+        let roster = FakeVSRServer.rosterBody(primaries.map(\.address))
+        let replies = partitions.map { _ in AsyncSemaphore(permits: 0) }
+        for (index, primary) in primaries.enumerated() {
+            let reply = replies[index]
+            await serve(primary, topic: topic) { request in
+                switch request.code.flatMap(CommandCode.init(rawValue:)) {
+                case .getClusterMetadata:
+                    return .ok(roster)
+                case .getPartitionRoute:
+                    let partition = UInt32(littleEndianBytes: request.payload.suffix(4))
+                    return .ok(
+                        FakeVSRServer.partitionRouteBody(
+                            FakeVSRServer.routeContext, partitionsCount: UInt32(primaryCount), primaryReplica: UInt8(partition - 1)))
+                case .fetchMessages:
+                    if let fetch = try? request.fetch, fetch.wait == 0 {
+                        return nil
+                    }
+                    guard (try? await reply.acquire(1)) == true else {
+                        return .status(IggyErrorCode.transientNotAccepted.rawValue)
+                    }
+                    return nil
+                default:
+                    return nil
+                }
+            }
+        }
+        let client = try await signedInClient(primaries[0])
+        let reader = try await standalone(client, partitions: partitions, start: .first, commit: onRead ? .onRead : .manual)
+        let reading = Task {
+            try await withDeadline(.now + .seconds(8)) { try await batches(reader, 3) }
+        }
+        let allWaiting = await eventually {
+            for primary in primaries {
+                if await requests(primary, .fetchMessages).isEmpty {
+                    return false
+                }
+            }
+            return true
+        }
+        #expect(allWaiting, "Every primary has a fetch in flight before any fetch replies")
+        if allWaiting {
+            let busyPartition = UInt32(primaryCount)
+            topic.append(6, to: busyPartition)
+            replies[primaryCount - 1].release(3)
+            #expect(try await reading.value == [[0, 1], [2, 3], [4, 5]])
+            #expect(topic.stored[busyPartition] == (onRead ? 5 : nil))
+            for primary in primaries.dropLast() {
+                #expect(await requests(primary, .fetchMessages).count == 1, "The quiet primary keeps its waiting fetch")
+            }
+        }
+        reading.cancel()
+        for (index, partition) in partitions.enumerated() {
+            topic.append(1, to: partition)
+            replies[index].release(primaryCount)
+        }
+        try await reader.close()
+        _ = try? await reading.value
+        await client.shutdown()
+        for primary in primaries {
+            await primary.stop()
+        }
+    }
+
     /// Partitions whose last section ended before their head read at once,
     /// so each one takes a fetch of its own while requests are free, with
     /// the full limits, as the base consumer kept a poll per partition.

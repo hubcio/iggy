@@ -119,7 +119,9 @@ impl ReaderBuilder {
         Self { options, ..self }
     }
 
-    /// The encoded bytes of the requests in flight and the queued batches. Default 16 MiB.
+    /// The requested encoded-byte budget for requests in flight and queued batches. Default
+    /// 16 MiB. The effective budget holds at least 32 full batches so primary groups can wait
+    /// independently. Larger byte and message budgets allow more queued batches.
     pub fn prefetch_bytes(self, bytes: u32) -> Self {
         Self {
             prefetch_bytes: bytes,
@@ -127,8 +129,8 @@ impl ReaderBuilder {
         }
     }
 
-    /// The messages of the requests in flight and the queued batches. Default: the larger of
-    /// 16,000 and `count`.
+    /// The requested message budget for requests in flight and queued batches. Default: the
+    /// larger of 16,000 and `count`. The effective budget holds at least 32 full batches.
     pub fn prefetch_messages(self, messages: u32) -> Self {
         Self {
             prefetch_messages: Some(messages),
@@ -326,8 +328,8 @@ impl ReaderBuilder {
 }
 
 /// The requests in flight and the queued replies, each of which reserves `count` messages and
-/// `max_bytes` bytes. One fits even when the prefetch limits are lower, and the driver admits at
-/// most 16 waiting requests of one consumer.
+/// `max_bytes` bytes. At least 32 fit even when the prefetch limits are lower. Larger budgets
+/// grow the queue independently of the driver's per-consumer request limit.
 fn budget_slots(prefetch_messages: u32, prefetch_bytes: u32, options: PollOptions) -> usize {
     let messages = prefetch_messages
         .checked_div(options.count)
@@ -337,5 +339,5 @@ fn budget_slots(prefetch_messages: u32, prefetch_bytes: u32, options: PollOption
         .unwrap_or_default();
     usize::try_from(messages.min(bytes))
         .unwrap_or(usize::MAX)
-        .clamp(1, MAX_DEFERRED_REQUESTS_PER_CONSUMER)
+        .max(MAX_DEFERRED_REQUESTS_PER_CONSUMER)
 }

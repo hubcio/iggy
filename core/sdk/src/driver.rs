@@ -61,6 +61,7 @@ use iggy_common::{
 };
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
@@ -68,7 +69,7 @@ use tracing::debug;
 mod route_cache;
 
 pub(crate) const MAX_DEFERRED_REQUESTS: usize = 64;
-pub(crate) const MAX_DEFERRED_REQUESTS_PER_CONSUMER: usize = 16;
+pub(crate) const MAX_DEFERRED_REQUESTS_PER_CONSUMER: usize = 32;
 /// Route lookups in flight while [`OperationDriver::readiness_groups`] groups
 /// the partitions of a wait. After a move, each stale partition needs one, so
 /// a primary that held 333 of 1000 partitions on 3 nodes costs 21 round trips
@@ -588,7 +589,7 @@ impl OperationDriver {
             };
             call.settle_sent();
             match next {
-                Next::Again if Instant::now() < call.deadline => {}
+                Next::Again if Instant::now() < call.attempt_deadline() => {}
                 Next::Again => return Err(call.expire()),
                 // The reader of the call closes and cancelled it, so its refusal is the answer.
                 Next::Pause if call.committing() && committing_cancel_requested() => {
@@ -652,6 +653,9 @@ impl OperationDriver {
             }
             Some(error) => return Err(Next::Fail(error)),
             None => {}
+        }
+        if Instant::now() >= call.attempt_deadline() {
+            return Err(Next::Again);
         }
         if call.frame.is_some() && call.fence() != Some(self.session.fence()) {
             // A replaced session can never apply the frame. An uncertain call
@@ -1727,7 +1731,15 @@ impl Call {
     ) -> Result<(Frame, &mut LaneTicket), Next> {
         let payload = self.deferred_payload();
         let ticket = self.ticket.insert(ticket);
-        let payload = payload.map_err(Next::Fail)?;
+        let payload = payload.map_err(|error| {
+            Next::Fail(
+                if self.code == FETCH_MESSAGES_CODE && error == IggyError::TransientNotAccepted {
+                    self.refusal.clone()
+                } else {
+                    error
+                },
+            )
+        })?;
         let mut frame = match &self.frame {
             Some(frame) => {
                 if !ticket.revalidate(lineage).map_err(Next::Fail)? {
@@ -1844,12 +1856,25 @@ impl Call {
         }
     }
 
+    /// Fetches and deferred-poll retries leave time for the reply.
+    fn attempt_deadline(&self) -> Instant {
+        if self.code == FETCH_MESSAGES_CODE
+            || (self.code == POLL_MESSAGES_DEFERRED_CODE && self.retries > 0)
+        {
+            self.deadline
+                .checked_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US))
+                .unwrap_or(self.started)
+        } else {
+            self.deadline
+        }
+    }
+
     /// Sleeps before the next attempt. Returns false instead if the attempt
     /// cannot start before the deadline.
     async fn pause(&mut self) -> bool {
         let retry = self.retries;
         self.retries = retry.saturating_add(1);
-        pause_before_retry(retry, self.deadline, rand::random()).await
+        pause_before_retry(retry, self.attempt_deadline(), rand::random()).await
     }
 
     /// Ends the call with the outcome that it proved.
@@ -4090,6 +4115,68 @@ mod tests {
             } else {
                 assert_eq!(result, Err(IggyError::TransientNotAccepted));
                 assert!(sent.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_capacity_refused_deferred_request_when_only_the_reply_margin_remains_should_keep_the_refusal()
+     {
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+        const REPLY_MARGIN: Duration = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        let refusal_delay = REQUEST_TIMEOUT - REPLY_MARGIN / 2;
+        for code in [FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE] {
+            for auto_commit in [false, true] {
+                let fixture = Fixture::new().await;
+                let request = FetchMessagesRequest {
+                    wait_us: 0,
+                    request_timeout_us: REQUEST_TIMEOUT.as_micros() as u64,
+                    ..fetch([PARTITION_ID], auto_commit, WirePollingStrategy::offset(0))
+                };
+                let poll = fixture.poll(auto_commit, WirePollingStrategy::offset(0));
+                let options = DeferredPollOptions {
+                    max_wait: Duration::ZERO.into(),
+                    request_timeout: REQUEST_TIMEOUT.into(),
+                    ..DeferredPollOptions::default()
+                };
+                fixture.cluster.script(
+                    &endpoint(PRIMARY),
+                    code,
+                    [Answer::Refuse(IggyError::DeferredPollCapacityExceeded)],
+                );
+                fixture.cluster.hold(code);
+                let started = Instant::now();
+                let call = async {
+                    if code == FETCH_MESSAGES_CODE {
+                        fixture.driver.fetch_messages(&request).await.map(|_| ())
+                    } else {
+                        fixture
+                            .driver
+                            .poll_with_options(&poll, None, Some(options))
+                            .await
+                            .map(|_| ())
+                    }
+                };
+
+                let (result, ()) = tokio::join!(call, async {
+                    eventually("deferred reply is held", || {
+                        fixture.cluster.count(code) == 1
+                    })
+                    .await;
+                    sleep_until(started + refusal_delay).await;
+                    fixture.cluster.release(code);
+                });
+
+                assert_eq!(
+                    result,
+                    Err(IggyError::DeferredPollCapacityExceeded),
+                    "code {code}, auto_commit {auto_commit}"
+                );
+                assert_eq!(
+                    fixture.cluster.count(code),
+                    1,
+                    "no attempt fits after the refusal"
+                );
             }
         }
     }

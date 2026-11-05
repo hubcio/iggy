@@ -2501,13 +2501,14 @@ mod tests {
     async fn byte_and_message_reservations_cover_inflight_and_queued_replies() {
         const BATCH_COUNT: u32 = 10;
         const REPLY_BYTES: u32 = 1024;
-        const SLOTS: usize = 2;
+        const SLOTS: usize = 32;
+        const PARTITIONS: u32 = SLOTS as u32 + 2;
         for (bytes, messages) in [
-            (REPLY_BYTES * 2, BATCH_COUNT * 10),
-            (REPLY_BYTES * 10, BATCH_COUNT * 2),
+            (REPLY_BYTES * SLOTS as u32, BATCH_COUNT * PARTITIONS),
+            (REPLY_BYTES * PARTITIONS, BATCH_COUNT * SLOTS as u32),
         ] {
             let (mut worker, mut receiver) = worker_of(
-                standalone([0, 1, 2, 3])
+                standalone(0..PARTITIONS)
                     .options(PollOptions {
                         count: BATCH_COUNT,
                         max_bytes: REPLY_BYTES,
@@ -2519,7 +2520,12 @@ mod tests {
             assert_eq!(worker.config.slots, SLOTS);
             let client = worker.config.client.clone();
             let _blocked_connection = client.write().await;
-            assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0, 1, 2, 3])));
+            assert!(worker.apply(assigned(
+                &worker,
+                SESSION,
+                VERSION,
+                (0..PARTITIONS).collect::<Vec<_>>()
+            )));
             worker.schedule();
             assert_eq!(worker.tasks.len(), SLOTS, "reserve before sending");
             assert_eq!(worker.capacity.available_permits(), 0);
@@ -2552,8 +2558,12 @@ mod tests {
                 1,
                 "an error waits for a slot under backpressure"
             );
-            let stale = receiver.recv().await.unwrap();
-            assert_ne!(stale.epoch, worker.epoch);
+            let mut stale = Vec::with_capacity(SLOTS - 1);
+            for _ in 1..SLOTS {
+                let reply = receiver.recv().await.unwrap();
+                assert_ne!(reply.epoch, worker.epoch);
+                stale.push(reply);
+            }
             let reported = receiver.recv().await.unwrap();
             assert_eq!(reported.epoch, worker.epoch);
             assert!(matches!(
@@ -2819,8 +2829,7 @@ mod tests {
     #[tokio::test]
     async fn given_a_partly_recovered_batch_when_ownership_changes_should_deliver_only_its_unread_messages()
      {
-        let (mut worker, mut receiver) =
-            worker_of(committing(standalone([0])).prefetch_messages(1));
+        let (mut worker, mut receiver) = worker_with_slots(committing(standalone([0])), 1);
         assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
         worker.positions.insert(0, next_at(0, 5));
         worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
@@ -3066,7 +3075,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         assert!(worker.retained_batches.is_empty());
         assert!(worker.catch_up.is_empty());
-        assert_eq!(worker.capacity.available_permits(), 1);
+        assert_eq!(worker.capacity.available_permits(), worker.config.slots);
     }
 
     #[tokio::test]
@@ -3305,7 +3314,7 @@ mod tests {
                 &PARTITIONS[..BUDGET_SLOTS],
             ),
         ] {
-            let (mut worker, _receiver) = worker_of(builder);
+            let (mut worker, _receiver) = worker_with_slots(builder, polled_partitions.len());
             let client = worker.config.client.clone();
             let _blocked_connection = client.write().await;
             assert_eq!(
@@ -5375,11 +5384,8 @@ mod tests {
         const SLOTS: u32 = 2;
         const REGROUPS: usize = 8;
         let options = PollOptions::default();
-        let (mut worker, receiver) = worker_of(
-            builder_for(group())
-                .options(options)
-                .prefetch_bytes(options.max_bytes * SLOTS),
-        );
+        let (mut worker, receiver) =
+            worker_with_slots(builder_for(group()).options(options), SLOTS as usize);
         let slots = worker.config.slots;
         assert_eq!(slots, SLOTS as usize);
         let client = worker.config.client.clone();
@@ -5418,12 +5424,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn given_a_single_batch_budget_and_idle_groups_when_another_group_has_data_should_keep_reading_it()
+     {
+        const GROUPS: u32 = 3;
+        const BUSY: u32 = GROUPS - 1;
+        for builder in [builder_for(group()), committing(builder_for(group()))] {
+            let options = PollOptions::default();
+            let (mut worker, mut receiver) = worker_of(
+                builder
+                    .prefetch_messages(options.count)
+                    .prefetch_bytes(options.max_bytes),
+            );
+            let client = worker.config.client.clone();
+            let _blocked_connection = client.write().await;
+            let groups = (0..GROUPS).map(|partition| vec![partition]).collect();
+            assert!(worker.apply(grouped(&worker, SESSION, VERSION, groups)));
+            if worker.config.on_read() {
+                for partition in 0..GROUPS {
+                    worker.positions.insert(partition, next_at(partition, 0));
+                }
+            }
+            worker.shared.demand.store(true, ORDERING);
+            worker.schedule();
+            assert_eq!(
+                worker.active.len(),
+                GROUPS as usize,
+                "every idle primary waits concurrently despite the requested one-batch budget"
+            );
+            let waiting = [fetch_of(&worker, 0), fetch_of(&worker, 1)];
+            let first = fetch_of(&worker, BUSY);
+
+            answer(&mut worker, BUSY, &[behind_head(BUSY, &[0], 1)]).await;
+            assert_eq!(next_batches(&mut receiver)[0].partition_id, BUSY);
+            worker.shared.demand.store(true, ORDERING);
+            worker.schedule();
+
+            assert_ne!(fetch_of(&worker, BUSY), first, "the backlog keeps draining");
+            assert_eq!(
+                [fetch_of(&worker, 0), fetch_of(&worker, 1)],
+                waiting,
+                "the other primaries' unanswered waits do not hold the backlog"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn given_more_groups_than_slots_when_each_fetch_ends_should_give_every_group_a_turn() {
         const GROUPS: u32 = 3;
         for builder in [builder_for(group()), committing(builder_for(group()))] {
-            let max_bytes = PollOptions::default().max_bytes;
-            let (mut worker, _receiver) = worker_of(builder.prefetch_bytes(max_bytes));
+            let (mut worker, _receiver) = worker_with_slots(builder, 1);
             assert_eq!(worker.config.slots, 1);
             let client = worker.config.client.clone();
             let _blocked_connection = client.write().await;
@@ -5468,11 +5518,7 @@ mod tests {
             commit: CommitPolicy::OnRead,
             ..PollOptions::default()
         };
-        let (mut worker, _receiver) = worker_of(
-            builder_for(group())
-                .options(options)
-                .prefetch_messages(options.count),
-        );
+        let (mut worker, _receiver) = worker_with_slots(builder_for(group()).options(options), 1);
         assert_eq!(worker.config.slots, 1);
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
@@ -5491,11 +5537,8 @@ mod tests {
      {
         const SLOTS: u32 = 2;
         let options = PollOptions::default();
-        let (mut worker, _receiver) = worker_of(
-            builder_for(group())
-                .options(options)
-                .prefetch_bytes(options.max_bytes * SLOTS),
-        );
+        let (mut worker, _receiver) =
+            worker_with_slots(builder_for(group()).options(options), SLOTS as usize);
         assert_eq!(worker.config.slots, SLOTS as usize);
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
@@ -5586,11 +5629,8 @@ mod tests {
      {
         const SLOTS: u32 = 3;
         let options = PollOptions::default();
-        let (mut worker, _receiver) = worker_of(
-            builder_for(group())
-                .options(options)
-                .prefetch_bytes(options.max_bytes * SLOTS),
-        );
+        let (mut worker, _receiver) =
+            worker_with_slots(builder_for(group()).options(options), SLOTS as usize);
         assert_eq!(worker.config.slots, SLOTS as usize);
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
@@ -5630,11 +5670,8 @@ mod tests {
             commit: CommitPolicy::OnRead,
             ..PollOptions::wait(IggyDuration::from(DEFAULT_MAX_WAIT))
         };
-        let (mut worker, mut receiver) = worker_of(
-            builder_for(group())
-                .options(options)
-                .prefetch_bytes(options.max_bytes * SLOTS),
-        );
+        let (mut worker, mut receiver) =
+            worker_with_slots(builder_for(group()).options(options), SLOTS as usize);
         assert_eq!(worker.config.slots, SLOTS as usize);
         let client = worker.config.client.clone();
         let _blocked_connection = client.write().await;
@@ -5840,6 +5877,13 @@ mod tests {
 
     fn worker_of(builder: ReaderBuilder) -> (Worker, Replies) {
         let (config, shared) = builder.into_parts().unwrap();
+        worker_on(config, shared)
+    }
+
+    /// Small isolated budgets keep scheduler saturation and recovery tests focused.
+    fn worker_with_slots(builder: ReaderBuilder, slots: usize) -> (Worker, Replies) {
+        let (mut config, shared) = builder.into_parts().unwrap();
+        config.slots = slots;
         worker_on(config, shared)
     }
 

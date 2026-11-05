@@ -1737,7 +1737,9 @@ mod tests {
     }
 
     #[test]
-    fn given_a_count_above_the_default_prefetch_when_building_should_fit_one_reply() {
+    fn given_a_count_above_the_default_prefetch_when_building_should_keep_the_minimum_batch_budget()
+    {
+        const MINIMUM_SLOTS: usize = 32;
         let long_batches = PollOptions {
             count: DEFAULT_PREFETCH_MESSAGES + 1,
             ..PollOptions::default()
@@ -1751,8 +1753,23 @@ mod tests {
         ] {
             let described = format!("{builder:?}");
             let (config, _) = builder.into_parts().unwrap();
-            assert_eq!(config.slots, 1, "{described}");
+            assert_eq!(config.slots, MINIMUM_SLOTS, "{described}");
         }
+    }
+
+    #[test]
+    fn given_a_larger_prefetch_budget_when_building_should_preserve_room_beyond_the_request_limit()
+    {
+        const BATCHES: u32 = 64;
+        let options = PollOptions::default();
+        let (config, _) = standalone([PARTITION])
+            .options(options)
+            .prefetch_messages(options.count * BATCHES)
+            .prefetch_bytes(options.max_bytes * BATCHES)
+            .into_parts()
+            .unwrap();
+
+        assert_eq!(config.slots, BATCHES as usize);
     }
 
     /// A reader without its fetch loop. The test sends the replies of the loop, each with a slot

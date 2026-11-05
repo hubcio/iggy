@@ -42,6 +42,7 @@ public final class PartitionReaderBuilder {
     public static final long DEFAULT_PREFETCH_MESSAGES = 16_000;
     public static final long DEFAULT_PREFETCH_BYTES = 16L * 1024 * 1024;
     public static final Duration DEFAULT_RETRY_INTERVAL = Duration.ofSeconds(1);
+    public static final int MIN_PREFETCH_SLOTS = 32;
 
     private final ReaderTransport transport;
     private List<Long> partitions;
@@ -82,13 +83,19 @@ public final class PartitionReaderBuilder {
         return this;
     }
 
-    /** The messages of the reads in flight and the queued batches. Default the larger of 16,000 and the count. */
+    /**
+     * The messages of the reads in flight and the queued batches. Default 16,000. The effective message and byte
+     * budgets each hold at least {@value #MIN_PREFETCH_SLOTS} reads, also when smaller limits are requested.
+     */
     public PartitionReaderBuilder prefetchMessages(long messages) {
         this.prefetchMessages = messages;
         return this;
     }
 
-    /** The bytes of the reads in flight and the queued batches. Default 16 MiB. */
+    /**
+     * The bytes of the reads in flight and the queued batches. Default 16 MiB. The effective limit is at least
+     * {@value #MIN_PREFETCH_SLOTS} times the maximum bytes of a read.
+     */
     public PartitionReaderBuilder prefetchBytes(long bytes) {
         this.prefetchBytes = bytes;
         return this;
@@ -118,12 +125,14 @@ public final class PartitionReaderBuilder {
                             ? "A consumer group reads the assignment of its member, not chosen partitions"
                             : "A standalone consumer needs its partitions");
         }
-        if (prefetchBytes < options.maxBytes() || retryInterval.isNegative() || retryInterval.isZero()) {
+        if (prefetchBytes < 0 || retryInterval.isNegative() || retryInterval.isZero()) {
             throw new IggyInvalidArgumentException(
-                    "A reader needs room for one read in its prefetch and a positive retry interval");
+                    "A reader needs nonnegative prefetch bytes and a positive retry interval");
         }
-        long messages = prefetchMessages > 0 ? prefetchMessages : Math.max(DEFAULT_PREFETCH_MESSAGES, options.count());
-        int slots = (int) Math.max(1, Math.min(messages / options.count(), prefetchBytes / options.maxBytes()));
+        long messages = prefetchMessages > 0 ? prefetchMessages : DEFAULT_PREFETCH_MESSAGES;
+        int slots = (int) Math.min(
+                Integer.MAX_VALUE,
+                Math.max(MIN_PREFETCH_SLOTS, Math.min(messages / options.count(), prefetchBytes / options.maxBytes())));
         PollingStrategy first = start.kind() == PollingKind.First
                 ? new PollingStrategy(PollingKind.Offset, BigInteger.ZERO, start.context())
                 : start;

@@ -6085,13 +6085,15 @@ class ReaderOptions final {
         return *this;
     }
 
-    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    /** @param prefetch_bytes Requested encoded bytes in flight and queued. Default 16 MiB. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ReaderOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
         prefetch_bytes_ = prefetch_bytes;
         return *this;
     }
 
-    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    /** @param prefetch_messages Requested messages in flight and queued. Default 16,000. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ReaderOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
         prefetch_messages_ = prefetch_messages;
         return *this;
@@ -6271,13 +6273,15 @@ class ConsumerOptions final {
         return *this;
     }
 
-    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    /** @param prefetch_bytes Requested encoded bytes in flight and queued. Default 16 MiB. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ConsumerOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
         prefetch_bytes_ = prefetch_bytes;
         return *this;
     }
 
-    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    /** @param prefetch_messages Requested messages in flight and queued. Default 16,000. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ConsumerOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
         prefetch_messages_ = prefetch_messages;
         return *this;

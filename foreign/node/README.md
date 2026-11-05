@@ -299,10 +299,11 @@ try {
   (`CommitEvery.Message`, `CommitEvery.Messages(n)` or `CommitEvery.Batch`),
   and in `close()`. `DEFAULT_AUTO_COMMIT` stores every 10,000 messages or 5 s
   after processing.
-- The reader reads ahead up to 16 MiB and 16,000 messages (`prefetchBytes`,
-  `prefetchMessages`). Without options a read waits up to 5 s. After a refused
-  read, a lost read or a failed refresh it waits `retryInterval`, 1 s by
-  default.
+- Requested read-ahead budgets default to 16 MiB and 16,000 messages
+  (`prefetchBytes`, `prefetchMessages`). Each effective budget holds at least
+  32 full batches, and larger configured budgets still apply. Without options
+  a read waits up to 5 s. After a refused read, a lost read or a failed refresh
+  it waits `retryInterval`, 1 s by default.
 
 ### Consumers
 

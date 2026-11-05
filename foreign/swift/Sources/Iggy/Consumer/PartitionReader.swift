@@ -152,10 +152,10 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
 public actor PartitionReader: AsyncSequence {
     public typealias Element = PolledMessages
 
-    /// The most requests of a reader in flight, as
+    /// Thirty-two requests can wait or read concurrently, as
     /// `MAX_DEFERRED_REQUESTS_PER_CONSUMER` in the Rust SDK, so a reader
     /// leaves deferred connections of its client to others.
-    static let maxRequestsInFlight = 16
+    static let maxRequestsInFlight = 32
     /// How often a waiting group member checks the assignment that its
     /// client syncs, as `ASSIGNMENT_REFRESH_INTERVAL` in the Rust SDK.
     static let assignmentCheckInterval: Duration = .seconds(1)

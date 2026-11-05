@@ -49,6 +49,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,6 +58,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.LongStream;
 
 import static org.apache.iggy.client.async.reader.FakeTransport.TIMEOUT;
 import static org.apache.iggy.client.async.reader.FakeTransport.refused;
@@ -70,6 +72,115 @@ class PartitionReaderTest {
     private static final Duration RETRY_INTERVAL = Duration.ofMillis(100);
     private static final PollOptions MANUAL = PollOptions.waitFor(Duration.ofSeconds(1));
     private static final PollOptions ON_READ = MANUAL.withCommit(CommitPolicy.onRead());
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReadEveryPrimaryWhileQuietGroupsWaitWithOneBatchPrefetch(boolean onRead) throws Exception {
+        FakeTransport transport =
+                new FakeTransport(true).groupedBy(partitions -> List.of(List.of(1L), List.of(2L), List.of(3L)));
+        PollOptions options = onRead ? ON_READ : MANUAL;
+        PartitionReader reader = PartitionReader.builder(transport)
+                .options(options)
+                .prefetchMessages(options.count())
+                .prefetchBytes(options.maxBytes())
+                .build()
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        try {
+            assignment(transport, 1L, 2L, 3L);
+            if (onRead) {
+                assertThat(transport.readsNothingFor(QUIET)).isTrue();
+            }
+            CompletableFuture<PolledMessages> waiting = reader.next();
+            List<Read> reads = List.of(transport.nextRead(), transport.nextRead(), transport.nextRead());
+            assertThat(reads)
+                    .as("every idle primary waits concurrently before any reply arrives")
+                    .extracting(read -> read.targets().keySet())
+                    .containsExactlyInAnyOrder(Set.of(1L), Set.of(2L), Set.of(3L));
+            assertThat(reads).extracting(Read::commit).containsOnly(onRead);
+            Read busy = reads.stream()
+                    .filter(read -> read.targets().containsKey(3L))
+                    .findFirst()
+                    .orElseThrow();
+            busy.answer(FakeTransport.backlogged(3, 10, 0));
+            assertThat(offsets(waiting.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(0L);
+
+            for (long offset : new long[] {1, 2}) {
+                waiting = reader.next();
+                Read again = transport.nextRead();
+                assertThat(again.targets()).containsOnlyKeys(3L);
+                assertThat(again.commit()).isEqualTo(onRead);
+                again.answer(FakeTransport.backlogged(3, 10, offset));
+                assertThat(offsets(waiting.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                        .containsExactly(offset);
+            }
+            assertThat(reads.stream().filter(read -> read != busy).map(Read::reply))
+                    .allSatisfy(reply -> assertThat(reply).isNotDone());
+        } finally {
+            closeGroupReader(reader, transport);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {0, 1})
+    void shouldRaiseTinyPrefetchBudgetsAndKeepQueuedBatchesWithinTheFloor(long bytes) throws Exception {
+        List<Long> partitions = LongStream.rangeClosed(1, PartitionReaderBuilder.MIN_PREFETCH_SLOTS + 1)
+                .boxed()
+                .toList();
+        FakeTransport transport = new FakeTransport(false)
+                .groupedBy(ids -> ids.stream().map(List::of).toList());
+        PartitionReader reader = PartitionReader.builder(transport)
+                .partitions(partitions)
+                .options(MANUAL)
+                .prefetchMessages(1)
+                .prefetchBytes(bytes)
+                .build()
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        try {
+            List<Read> reads = new ArrayList<>();
+            for (int slot = 0; slot < PartitionReaderBuilder.MIN_PREFETCH_SLOTS; slot++) {
+                reads.add(transport.nextRead());
+            }
+            assertThat(transport.readsNothingFor(QUIET)).isTrue();
+            Read first = reads.get(0);
+            long partition = first.targets().keySet().iterator().next();
+            first.answer(section(partition, 0));
+            assertThat(transport.readsNothingFor(QUIET))
+                    .as("a queued batch retains its prefetch slot until delivery")
+                    .isTrue();
+
+            assertThat(offsets(next(reader))).containsExactly(0L);
+            assertThat(transport.nextRead().targets())
+                    .containsOnlyKeys((long) PartitionReaderBuilder.MIN_PREFETCH_SLOTS + 1);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldPreserveLargerPrefetchBudgetsWithoutOverflow(boolean largestBudget) throws Exception {
+        int groups = PartitionReaderBuilder.MIN_PREFETCH_SLOTS + 1;
+        List<Long> partitions = LongStream.rangeClosed(1, groups).boxed().toList();
+        FakeTransport transport = new FakeTransport(false)
+                .groupedBy(ids -> ids.stream().map(List::of).toList());
+        PartitionReader reader = PartitionReader.builder(transport)
+                .partitions(partitions)
+                .options(MANUAL)
+                .prefetchMessages(largestBudget ? Long.MAX_VALUE : groups * MANUAL.count())
+                .prefetchBytes(largestBudget ? Long.MAX_VALUE : groups * MANUAL.maxBytes())
+                .build()
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        try {
+            Set<Long> reading = new HashSet<>();
+            for (int group = 0; group < groups; group++) {
+                reading.addAll(transport.nextRead().targets().keySet());
+            }
+            assertThat(reading).containsExactlyInAnyOrderElementsOf(partitions);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
 
     @Test
     void shouldReadEachGroupWithOneRequestAndHandOverBatchesInArrivalOrder() throws Exception {

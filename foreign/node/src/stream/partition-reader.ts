@@ -59,7 +59,8 @@ const TRANSIENT_REFUSALS = new Set([TRANSIENT_NOT_COMMITTED, TRANSIENT_NOT_ACCEP
   DEFERRED_POLL_CAPACITY_EXCEEDED, LIFECYCLE_BUSY]);
 const MAX_LASTING_REFUSALS = 6;
 /** The most reads in flight that a reader adds to spread a backlog, the deferred request limit of a Rust SDK consumer. */
-const MAX_READS_IN_FLIGHT = 16;
+const MAX_READS_IN_FLIGHT = 32;
+const MIN_PREFETCH_BATCHES = 32;
 const GROUP_REFRESH_MS = 1_000;
 /** The wait of a reader read when the caller sets none. */
 export const DEFAULT_READER_MAX_WAIT_MS = 5_000;
@@ -78,9 +79,9 @@ export type PartitionReaderRequest = {
   start?: PollingStrategy,
   /** The limits of each read and the commit policy. A read waits up to 5 s by default. */
   options?: Partial<PollOptions>,
-  /** The most bytes the reader holds read ahead of the application, 16 MiB by default. */
+  /** Requested read-ahead bytes, 16 MiB by default, raised to hold at least 32 full batches. */
   prefetchBytes?: number,
-  /** The most messages the reader holds read ahead of the application, 16,000 by default. */
+  /** Requested read-ahead messages, 16,000 by default, raised to hold at least 32 full batches. */
   prefetchMessages?: number,
   /** The wait in milliseconds before a refused partition reads again, 1 s by default. */
   retryInterval?: number
@@ -256,8 +257,10 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     const start = request.start ?? PollingStrategy.Next;
     this.start = start.kind === PollingStrategyKind.First ? PollingStrategy.Offset(0n) : start;
     this.group = request.consumer.kind === ConsumerKind.Group;
-    this.prefetchBytes = request.prefetchBytes ?? DEFAULT_PREFETCH_BYTES;
-    this.prefetchMessages = request.prefetchMessages ?? DEFAULT_PREFETCH_MESSAGES;
+    this.prefetchBytes = Math.max(request.prefetchBytes ?? DEFAULT_PREFETCH_BYTES,
+      MIN_PREFETCH_BATCHES * this.options.maxBytes);
+    this.prefetchMessages = Math.max(request.prefetchMessages ?? DEFAULT_PREFETCH_MESSAGES,
+      MIN_PREFETCH_BATCHES * this.options.count);
     this.retryInterval = request.retryInterval ?? 1_000;
     for (const partition of request.partitions ?? [])
       this.states.set(partition, this.newState());

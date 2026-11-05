@@ -46,6 +46,7 @@ const INVALID_COMMAND = 3;
 const UNAUTHORIZED = 41;
 const INVALID_SIZE_BYTES = 80;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
+const PARKED_READ_WAIT_MS = 60_000;
 /** A poll body ends with the strategy kind and value, the count and the auto-commit flag. */
 const POLL_SUFFIX_SIZE = 1 + 8 + 4 + 1;
 
@@ -102,6 +103,8 @@ class FakeTopic {
   readonly refused = new Map<number, number>();
   /** A read by offset finds nothing, as after its messages were removed. */
   emptyOffsetReads = false;
+  readonly emptyPartitions = new Set<number>();
+  idleWait = 50;
   /** Every offset store fails with this error. */
   storeFailure?: Error;
   /**
@@ -171,7 +174,8 @@ class FakeTopic {
         autocommit: body[body.length - 1] !== 0, count: body.readUInt32LE(at + 9), at: Date.now() };
       this.reads.push(read);
       const start = this.start(partition, read.kind, read.value);
-      if (start >= this.limit || (this.emptyOffsetReads && read.kind === PollingStrategyKind.Offset))
+      if (start >= this.limit || this.emptyPartitions.has(partition) ||
+          (this.emptyOffsetReads && read.kind === PollingStrategyKind.Offset))
         return this.idle(options, reply(pollReply(partition, start, Buffer.alloc(0), 0, this.served())));
       const held = this.pollsHoldCount ? Math.min(read.count, Number(this.limit - start)) : 2;
       if (read.autocommit) this.stored.set(partition, start + BigInt(held) - 1n);
@@ -233,7 +237,7 @@ class FakeTopic {
         continue;
       }
       const start = this.start(partition, read.kind, read.value);
-      if (start >= this.limit || (this.countLimited && held >= count)) {
+      if (start >= this.limit || this.emptyPartitions.has(partition) || (this.countLimited && held >= count)) {
         sections.push({ partition, status: 0, start, records: Buffer.alloc(0) });
         continue;
       }
@@ -264,7 +268,7 @@ class FakeTopic {
   /** A read that finds nothing waits until the reader stops it, as a parked read does. */
   private idle(options: SendCommandOptions | undefined, reply: CommandResponse): Promise<CommandResponse> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => resolve(reply), 50);
+      const timer = setTimeout(() => resolve(reply), this.idleWait);
       options?.signal?.addEventListener('abort', () => {
         clearTimeout(timer);
         reject(options.signal!.reason);
@@ -338,6 +342,92 @@ describe('partition reader', () => {
     const fetched = topic.reads.filter(({ code }) => code === COMMAND_CODE.FetchMessages);
     assert.ok(fetched.length >= 4);
   });
+
+  for (const [requestedBatches, expectedBatches] of [[1, 32], [40, 40]]) {
+    it(`buffers ${expectedBatches} batches with a ${requestedBatches}-batch budget while two primaries stay empty`, async () => {
+      const count = 2;
+      const maxBytes = 512;
+      const partitions = [0, 1, 2];
+      const busy = partitions[2];
+      const topic = new FakeTopic(BigInt((expectedBatches + 1) * count));
+      topic.emptyPartitions.add(partitions[0]).add(partitions[1]);
+      topic.idleWait = PARKED_READ_WAIT_MS;
+      const client = topic.client();
+      client.readinessGroups = async (_stream, _topic, targets) => targets.map((partition) => [partition]);
+      const reader = await PartitionReader.open(async () => client, {
+        streamId: 1, topicId: 2, consumer, partitions, start: PollingStrategy.Offset(0n),
+        options: { count, maxBytes }, prefetchMessages: requestedBatches * count,
+        prefetchBytes: requestedBatches * maxBytes
+      });
+      try {
+        await waitFor(() => topic.reads.filter(({ partition }) => partition === busy).length === expectedBatches,
+          'the busy primary did not fill the effective read-ahead budget');
+        await new Promise(setImmediate);
+        assert.equal(topic.reads.filter(({ partition }) => partition === busy).length, expectedBatches);
+        for (const quiet of topic.emptyPartitions)
+          assert.equal(topic.reads.filter(({ partition }) => partition === quiet).length, 1);
+        assert.equal(topic.stored.size, 0);
+      } finally {
+        await reader.close();
+      }
+    });
+  }
+
+  it('keeps on-read demand and drains a busy primary while two empty primaries wait', async () => {
+    const count = 2;
+    const maxBytes = 512;
+    const topic = new FakeTopic(6n);
+    topic.emptyPartitions.add(0).add(1);
+    topic.idleWait = PARKED_READ_WAIT_MS;
+    const client = topic.client();
+    client.readinessGroups = async (_stream, _topic, targets) => targets.map((partition) => [partition]);
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer, partitions: [0, 1, 2], start: PollingStrategy.Offset(0n),
+      options: { count, maxBytes, commit: CommitPolicy.OnRead }, prefetchMessages: count, prefetchBytes: maxBytes
+    });
+    try {
+      await new Promise(setImmediate);
+      assert.equal(topic.reads.length, 0, 'on-read waits for application demand');
+      const batches = [];
+      for (let batch = 0; batch < 3; batch += 1)
+        batches.push(await reader.next({ signal: AbortSignal.timeout(1_000) }));
+      assert.deepEqual(offsets(batches), [0n, 1n, 2n, 3n, 4n, 5n]);
+      assert.ok(batches.every(({ partitionId }) => partitionId === 2));
+      assert.ok(topic.reads.every(({ autocommit }) => autocommit));
+      for (const quiet of topic.emptyPartitions)
+        assert.equal(topic.reads.filter(({ partition }) => partition === quiet).length, 1);
+      assert.deepEqual([...topic.stored], [[2, 5n]]);
+    } finally {
+      await reader.close();
+    }
+  });
+
+  for (const commit of [CommitPolicy.Manual, CommitPolicy.OnRead]) {
+    it(`waits on all three idle primaries together with a one-batch ${commit.kind} budget`, async () => {
+      const count = 2;
+      const maxBytes = 512;
+      const topic = new FakeTopic(0n);
+      topic.idleWait = PARKED_READ_WAIT_MS;
+      const client = topic.client();
+      client.readinessGroups = async (_stream, _topic, targets) => targets.map((partition) => [partition]);
+      const reader = await PartitionReader.open(async () => client, {
+        streamId: 1, topicId: 2, consumer, partitions: [0, 1, 2], start: PollingStrategy.Offset(0n),
+        options: { count, maxBytes, commit }, prefetchMessages: count, prefetchBytes: maxBytes
+      });
+      let settled = false;
+      const pending = reader.next().then(() => { settled = true; }, () => { settled = true; });
+      try {
+        await waitFor(() => topic.fetches.length === 3, 'an idle primary waited for another primary to finish');
+        assert.deepEqual(topic.fetches, [[0], [1], [2]]);
+        assert.equal(topic.stored.size, 0);
+        assert.ok(topic.reads.every(({ autocommit }) => autocommit === (commit.kind === 'onRead')));
+        assert.equal(settled, false, 'an idle request stays pending');
+      } finally {
+        await reader.close();
+        await pending;
+      }
+    });
+  }
 
   it('stores a checkpoint of its own and refuses one of another reader', async () => {
     const topic = new FakeTopic();
@@ -888,11 +978,43 @@ describe('partition reader', () => {
     assert.deepEqual(partitions, [1, 3, 5]);
   });
 
+  it('spreads a committing backlog over 32 slots even when the requested budget holds one batch', async () => {
+    const slots = 32;
+    const count = 2;
+    const maxBytes = 512;
+    const partitions = Array.from({ length: slots }, (_, index) => index * 2 + 1);
+    const topic = new FakeTopic(100n);
+    topic.countLimited = true;
+    topic.reportsHead = true;
+    topic.holdFetches = true;
+    const client = topic.client();
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer, partitions, start: PollingStrategy.Offset(0n),
+      options: { count, maxBytes, commit: CommitPolicy.OnRead }, prefetchMessages: count, prefetchBytes: maxBytes
+    });
+    let next: Promise<unknown> | undefined;
+    try {
+      const first = reader.next();
+      await waitFor(() => topic.heldFetches.length === 1, 'the initial grouped fetch did not start');
+      topic.heldFetches.shift()!();
+      assert.deepEqual(offsets([await first]), [0n, 1n]);
+      next = reader.next();
+      await waitFor(() => topic.fetches.length === slots + 1, 'the backlog did not use all 32 slots');
+      assert.deepEqual(topic.fetches.slice(1).map(([partition]) => partition).sort((left, right) => left - right), partitions);
+      assert.ok(topic.fetches.slice(1).every((targets) => targets.length === 1));
+    } finally {
+      topic.holdFetches = false;
+      for (const release of topic.heldFetches.splice(0)) release();
+      await next;
+      await reader.close();
+    }
+  });
+
   for (const [prefetchBytes, spread] of [
     [undefined, [[1], [3], [5], [7], [9]]],
-    [3 * 1_048_576, [[1, 5, 9], [3, 7]]]
+    [3 * 1_048_576, [[1], [3], [5], [7], [9]]]
   ] as const) {
-    it(`spreads the backlogged partitions of a primary over the free read slots (${spread.length} slots)`, async () => {
+    it(`spreads backlogged partitions over free read slots with ${prefetchBytes ?? 'default'} requested bytes`, async () => {
       const topic = new FakeTopic(100n);
       topic.reportsHead = true;
       topic.holdFetches = true;
@@ -917,9 +1039,9 @@ describe('partition reader', () => {
 
   for (const [prefetchBytes, spread] of [
     [undefined, [[1], [3], [5], [7], [9]]],
-    [3 * 1_048_576, [[1, 7], [3, 9], [5]]]
+    [3 * 1_048_576, [[1], [3], [5], [7], [9]]]
   ] as const) {
-    it(`spreads the backlogged partitions of a primary over the free slots of a committing reader (${spread.length} slots)`,
+    it(`spreads backlogged partitions over committing read slots with ${prefetchBytes ?? 'default'} requested bytes`,
       async () => {
         const topic = new FakeTopic(100n);
         topic.reportsHead = true;

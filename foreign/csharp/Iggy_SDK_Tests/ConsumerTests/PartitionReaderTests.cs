@@ -70,6 +70,97 @@ public sealed class PartitionReaderTests
         Assert.Contains(cluster.Fetches, fetch => fetch.Node == 1);
     }
 
+    [Theory]
+    [InlineData(1u, false, 32)]
+    [InlineData(64u, false, 64)]
+    [InlineData(1u, true, 32)]
+    public async Task given_prefetch_budgets_when_buffering_should_apply_a_thirty_two_batch_floor(
+        uint requestedBatches, bool byteLimited, int expectedBatches)
+    {
+        const uint MessagesPerBatch = 2;
+        using var cluster = new ReaderCluster(1)
+        {
+            Limit = (ulong)expectedBatches * MessagesPerBatch,
+            ReportsHead = true
+        };
+        using var client = await cluster.ConnectAsync();
+        await using var reader = await client.Reader(Stream, Topic, Consumer.New(4))
+            .WithPartitions(0)
+            .WithStart(PollingStrategy.Offset(0))
+            .WithOptions(new PollOptions { Count = MessagesPerBatch, MaxBytes = uint.MaxValue })
+            .WithPrefetch(byteLimited ? 1u : uint.MaxValue,
+                byteLimited ? uint.MaxValue : requestedBatches * MessagesPerBatch)
+            .WithRetryInterval(RetryInterval)
+            .BuildAsync(Token);
+
+        await UntilAsync(() => cluster.Fetches.Count >= expectedBatches);
+
+        var batches = await ReadAsync(reader, expectedBatches);
+        Assert.Equal(Enumerable.Range(0, expectedBatches).Select(index => (ulong)index * MessagesPerBatch),
+            batches.Select(batch => batch.Messages[0].Header.Offset));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task given_one_batch_budget_and_three_primaries_when_two_wait_should_drain_the_ready_primary(
+        bool onRead, bool initiallyEmpty)
+    {
+        const int Primaries = 3;
+        const uint BusyPartition = 2;
+        const ulong Messages = 8;
+        var options = new PollOptions
+        {
+            Count = 2,
+            MaxWait = TimeSpan.FromSeconds(30),
+            Commit = onRead ? CommitPolicy.OnRead : CommitPolicy.Manual
+        };
+        using var cluster = new ReaderCluster(Primaries)
+        {
+            Limit = initiallyEmpty ? 0 : Messages,
+            ReportsHead = true,
+            HoldFetches = true
+        };
+        cluster.Stored[0] = Messages - 1;
+        cluster.Stored[1] = Messages - 1;
+        using var client = await cluster.ConnectAsync();
+        var reader = await client.Reader(Stream, Topic, Consumer.New(4))
+            .WithPartitions(0, 1, BusyPartition)
+            .WithStart(PollingStrategy.Next().WithContext(ReaderCluster.Served))
+            .WithOptions(options)
+            .WithPrefetch(options.MaxBytes, options.Count)
+            .BuildAsync(Token);
+        try
+        {
+            var first = reader.NextAsync(Token).AsTask();
+            await UntilAsync(() => cluster.HeldFetches == Primaries);
+            Assert.Equal([0u, 1u, BusyPartition],
+                cluster.Held.SelectMany(fetch => fetch.Targets).Select(target => target.PartitionId).Order());
+            Assert.All(cluster.Held, fetch => Assert.Equal(onRead, fetch.AutoCommit));
+
+            cluster.Limit = Messages;
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+
+            List<PolledMessages> batches = [await first.WaitAsync(PromptLimit, Token)];
+            batches.AddRange(await ReadAsync(reader, (int)(Messages / options.Count) - 1));
+            Assert.All(batches, batch => Assert.Equal(BusyPartition, batch.PartitionId));
+            Assert.Equal(Enumerable.Range(0, (int)Messages).Select(offset => (ulong)offset),
+                batches.SelectMany(batch => batch.Messages).Select(message => message.Header.Offset));
+            Assert.Single(cluster.Fetches, fetch => fetch.Node == 0);
+            Assert.Single(cluster.Fetches, fetch => fetch.Node == 1);
+            Assert.Equal(onRead, cluster.Stored.ContainsKey(BusyPartition));
+        }
+        finally
+        {
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await reader.CloseAsync();
+        }
+    }
+
     /// <summary>
     ///     The client routed partition 2 to node 0 before node 1 took it over, so the first fetch of the reader names
     ///     it at node 0, which refuses its section as not primary. The reader looks the route up again by itself.
@@ -1018,17 +1109,32 @@ public sealed class PartitionReaderTests
     [Fact]
     public async Task given_partitions_of_one_primary_when_a_fetch_reaches_its_count_should_give_each_partition_its_turn()
     {
-        using var cluster = new ReaderCluster(2) { Limit = 100, CountLimited = true };
+        uint[] partitions = [1, 3, 5];
+        using var cluster = new ReaderCluster(2) { Limit = 100, CountLimited = true, HoldFetches = true };
         using var client = await cluster.ConnectAsync();
         var reader = await client.Reader(Stream, Topic, Consumer.New(4))
-            .WithPartitions(1, 3, 5)
+            .WithPartitions(partitions)
             .WithOptions(new PollOptions { Count = 2, MaxWait = TimeSpan.FromMilliseconds(100) })
             .WithRetryInterval(RetryInterval).BuildAsync(Token);
+        try
+        {
+            foreach (var partition in partitions)
+            {
+                await UntilAsync(() => cluster.Held.Sum(fetch => fetch.Targets.Length) == partitions.Length);
+                Assert.Contains(cluster.Held, fetch => fetch.Targets[0].PartitionId == partition);
+                var reads = cluster.HeldFetches;
+                await cluster.ReleaseHeldAsync(reads);
 
-        var delivered = await ReadAsync(reader, 3);
-        await reader.CloseAsync();
-
-        Assert.Equal([1u, 3u, 5u], delivered.Select(batch => batch.PartitionId));
+                var delivered = await ReadAsync(reader, reads);
+                Assert.Contains(delivered, batch => batch.PartitionId == partition);
+            }
+        }
+        finally
+        {
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await reader.CloseAsync();
+        }
     }
 
     /// <summary>
@@ -1038,18 +1144,22 @@ public sealed class PartitionReaderTests
     [Fact]
     public async Task given_backlogged_partitions_of_one_primary_when_slots_are_free_should_read_each_in_its_own_fetch()
     {
+        const int Partitions = 32;
+        var options = new PollOptions();
         using var cluster = new ReaderCluster(1) { Limit = 100, ReportsHead = true, HoldFetches = true };
         using var client = await cluster.ConnectAsync();
-        var reader = await Reader(client, CommitPolicy.Manual, 0, 1, 2, 3).BuildAsync(Token);
+        var reader = await Reader(client, CommitPolicy.Manual,
+                [.. Enumerable.Range(0, Partitions).Select(partition => (uint)partition)])
+            .WithPrefetch(options.MaxBytes, options.Count).BuildAsync(Token);
         try
         {
             await UntilAsync(() => cluster.HeldFetches == 1);
             await cluster.ReleaseHeldAsync();
 
-            await UntilAsync(() => cluster.Held.Sum(fetch => fetch.Targets.Length) == 4);
+            await UntilAsync(() => cluster.Held.Sum(fetch => fetch.Targets.Length) == Partitions);
 
             Assert.All(cluster.Held, fetch => Assert.Single(fetch.Targets));
-            Assert.Equal(4, cluster.HeldFetches);
+            Assert.Equal(Partitions, cluster.HeldFetches);
         }
         finally
         {

@@ -74,7 +74,8 @@ namespace Apache.Iggy.Consumers;
 public sealed class PartitionReader : IAsyncDisposable
 {
     private const int MaxLastingRefusals = 6;
-    private const int MaxFetchSlots = 16;
+    private const int MinPrefetchBatches = 32;
+    private const int MaxFetchSlots = 32;
     private const int ConsumerOffsetNotFound = 3021;
     private static readonly TimeSpan GroupRefreshInterval = TimeSpan.FromSeconds(1);
     private static long _readers;
@@ -89,6 +90,8 @@ public sealed class PartitionReader : IAsyncDisposable
     private readonly LinkedList<Entry> _queue = new();
     private readonly HashSet<Task> _reads = [];
     private readonly ReaderSettings _settings;
+    private readonly long _prefetchBytes;
+    private readonly long _prefetchMessages;
     private readonly SortedDictionary<uint, PartitionState> _states = [];
     private readonly Dictionary<uint, ulong> _sought = [];
     private readonly SemaphoreSlim _storeSignal = new(0, 1);
@@ -118,6 +121,8 @@ public sealed class PartitionReader : IAsyncDisposable
         _assignment = assignment;
         _fetcher = client as IPartitionFetchClient;
         _settings = settings;
+        _prefetchBytes = Math.Max(settings.PrefetchBytes, (long)settings.Options.MaxBytes * MinPrefetchBatches);
+        _prefetchMessages = Math.Max(settings.PrefetchMessages, (long)settings.Options.Count * MinPrefetchBatches);
         _logger = logger;
         _joinedSession = (client as ISessionGenerationProvider)?.SessionGeneration ?? 0;
         foreach (var partition in settings.Partitions)
@@ -888,7 +893,7 @@ public sealed class PartitionReader : IAsyncDisposable
         {
             var reading = OnRead
                 ? _demand && _queue.Count == 0
-                : _queuedMessages < _settings.PrefetchMessages && _queuedBytes < _settings.PrefetchBytes;
+                : _queuedMessages < _prefetchMessages && _queuedBytes < _prefetchBytes;
             if (reading)
             {
                 foreach (var (partition, state) in _states)
@@ -968,9 +973,9 @@ public sealed class PartitionReader : IAsyncDisposable
                     group.Where(partition => _states.TryGetValue(partition, out var state) && state.Backlogged).ToList(),
                     group.Where(partition => !_states.TryGetValue(partition, out var state) || !state.Backlogged).ToList()))
             ];
-            var slots = Math.Min(_settings.PrefetchMessages / Math.Max(_settings.Options.Count, 1),
-                _settings.PrefetchBytes / Math.Max(_settings.Options.MaxBytes, 1));
-            free = (int)Math.Clamp(slots, 1, MaxFetchSlots) - _fetching - groups.Count - alone;
+            var slots = Math.Min(_prefetchMessages / Math.Max(_settings.Options.Count, 1),
+                _prefetchBytes / Math.Max(_settings.Options.MaxBytes, 1));
+            free = (int)Math.Min(slots, MaxFetchSlots) - _fetching - groups.Count - alone;
         }
 
         // Every fetch holds at least one partition, so a group without quiet partitions keeps one backlogged.

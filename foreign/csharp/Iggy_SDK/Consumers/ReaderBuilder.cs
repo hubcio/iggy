@@ -89,8 +89,9 @@ public sealed class ReaderBuilder
     }
 
     /// <summary>
-    ///     The most bytes and messages that the reader holds read ahead of the application, 16 MiB and 16,000 by
-    ///     default. With <see cref="CommitPolicy.OnRead" /> the reader reads only when the application waits.
+    ///     The requested byte and message budgets, 16 MiB and 16,000 by default. Each effective budget holds at
+    ///     least 32 full batches so primary groups can wait independently. Larger budgets allow more queued batches.
+    ///     With <see cref="CommitPolicy.OnRead" /> the reader reads only when the application waits.
     /// </summary>
     public ReaderBuilder WithPrefetch(uint bytes, uint messages)
     {

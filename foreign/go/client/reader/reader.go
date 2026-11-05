@@ -37,13 +37,14 @@ import (
 const (
 	// DefaultMaxWait is the wait of a read of a reader unless its options say otherwise.
 	DefaultMaxWait = 5 * time.Second
-	// DefaultPrefetchMessages bounds the messages of the reads in flight and the queued batches.
+	// DefaultPrefetchMessages is the requested message budget before the minimum read capacity applies.
 	DefaultPrefetchMessages = 16_000
 	// DefaultRetryInterval is the pause before a refused or failed read is sent again.
 	DefaultRetryInterval      = time.Second
 	lastingRefusalsBeforeStop = 6
 	maxBackoffShift           = 5
 	wholeReader               = -1
+	minimumPrefetchSlots      = 32
 )
 
 // ReadError is an error of a read. The reader stays usable after it and retries by itself.
@@ -103,8 +104,10 @@ func WithPollOptions(options iggcon.PollOptions) Option {
 	return func(c *config) { c.options = options }
 }
 
-// WithPrefetchMessages bounds the messages of the reads in flight and the
-// queued batches, the larger of DefaultPrefetchMessages and the count by default.
+// WithPrefetchMessages sets the requested message budget for reads in flight
+// and queued batches, the larger of DefaultPrefetchMessages and the count by default.
+// The effective budget holds at least 32 full reads so quiet primaries do not
+// occupy the only slot. Larger budgets allow more prefetched batches.
 func WithPrefetchMessages(messages uint32) Option {
 	return func(c *config) { c.prefetchMessages = messages }
 }
@@ -288,7 +291,7 @@ func NewPartitionReader(
 	run, stop := context.WithCancel(context.WithoutCancel(ctx))
 	r := &PartitionReader{
 		client: client, transport: fetcher, stream: streamId, topic: topicId, consumer: consumer, config: cfg,
-		slots: int(max(1, prefetch/uint64(cfg.options.Count))), group: group,
+		slots: int(max(minimumPrefetchSlots, prefetch/uint64(cfg.options.Count))), group: group,
 		onRead:     cfg.options.Commit.Kind == iggcon.CommitOnRead,
 		partitions: make(map[uint32]*partition), changed: make(chan struct{}), regroup: true,
 		storeDue: make(chan struct{}, 1), wake: make(chan struct{}, 1), run: run, stop: stop,
