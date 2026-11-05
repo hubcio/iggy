@@ -2140,8 +2140,6 @@ dependencies = [
  "iggy_binary_protocol",
  "iggy_common",
  "message_bus",
- "rand 0.10.3",
- "rand_xoshiro",
  "serde",
  "server_common",
  "tracing",
