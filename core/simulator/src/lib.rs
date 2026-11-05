@@ -3196,7 +3196,7 @@ mod tests {
                         consensus.commit_max(),
                         partition.log.journal().inner.holds_op(fence_op),
                         partition.history_deleted(),
-                        partition.repair,
+                        partition.repair.as_deref().copied(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -18287,7 +18287,7 @@ mod applied_divergence_resync_tests {
         {
             let partitions = shard.plane.partitions();
             let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-            partition.transfer = Some(PartitionTransferSession {
+            partition.transfer = Some(Box::new(PartitionTransferSession {
                 nonce: TRANSFER_NONCE,
                 peer: 0,
                 commit_op: 0,
@@ -18298,7 +18298,7 @@ mod applied_divergence_resync_tests {
                 scan: None,
                 seed: None,
                 pulled_len: 0,
-            });
+            }));
             let consensus = partition.consensus();
             consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
             consensus.set_state_transfer_stage(StateTransferStage::Fetching);
