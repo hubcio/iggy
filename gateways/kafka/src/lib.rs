@@ -31,3 +31,4 @@ pub mod tls;
 
 pub use iggy_kafka_wire::records;
 pub use server::{CoordinatorLog, GatewayConfig, KafkaGateway};
+// Stack CI test, layer 2. This comment changes no behavior.
