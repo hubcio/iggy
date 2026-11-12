@@ -40,7 +40,7 @@ pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
-pub use repair_memory::{RepairMemoryBudget, RepairRingBudget};
+pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
 mod segment;
 pub mod segment_anchor;
 mod segment_recovery;

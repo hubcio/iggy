@@ -4622,7 +4622,7 @@ where
         self.poll_history = PollHistoryId::default();
         self.publish_poll_visibility();
         self.discard_queued_auto_commits();
-        self.transfer_plan.borrow_mut().take();
+        self.drop_transfer_plan();
     }
 
     /// The served history and what commits made visible in it. A change of
@@ -7161,6 +7161,17 @@ where
             *self.transfer_plan.borrow(),
             Some(TransferPlanSlot::Pinned(_))
         )
+    }
+
+    /// Empties the transfer plan slot. A pinned plan kept the shard's shed
+    /// out of the repair ring, so the ring queues for the shed again.
+    pub(crate) fn drop_transfer_plan(&self) {
+        if matches!(
+            self.transfer_plan.borrow_mut().take(),
+            Some(TransferPlanSlot::Pinned(_))
+        ) {
+            self.log.journal().inner.queue_ring_shed();
+        }
     }
 
     /// The plan an offer round hashes against, or `None` while the flush that
