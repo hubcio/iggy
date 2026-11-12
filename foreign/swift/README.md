@@ -603,3 +603,5 @@ For a stable release, the PMC vote must cover the Swift version and source archi
 After that, run the Publish workflow on the voted commit with `publish_other=swift` and `create_edge_docker_tag=false`. Run with `dry_run=true` first, then `dry_run=false` and `skip_tag_creation=false` to publish the tag.
 
 The root `Package.swift` declares only the library. Its tools version, platforms, dependencies and `Iggy` target must match this package's manifest, and CI fails when they differ.
+
+CI gate test. Do not merge.
