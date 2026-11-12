@@ -80,3 +80,5 @@ The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, an
 ## Contributing
 
 Feel free to contribute to the project. Your feedback and contributions are highly appreciated!
+
+Stack CI test, layer 1. Do not merge.
