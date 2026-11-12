@@ -69,6 +69,7 @@ jobs:
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
       task: test-build
+      stack-base: ${{ needs.detect.outputs.stack_base }}
       timeout-minutes: 60
 
   # Rust components
@@ -95,6 +96,7 @@ jobs:
     uses: ./.github/workflows/_rust.yml
     with:
       plan: ${{ needs.detect.outputs.rust_runtime_plan }}
+      stack-base: ${{ needs.detect.outputs.stack_base }}
 
   # Python SDK
   test-python:
