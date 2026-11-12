@@ -3196,7 +3196,7 @@ mod tests {
                         consensus.commit_max(),
                         partition.log.journal().inner.holds_op(fence_op),
                         partition.history_deleted(),
-                        partition.repair.as_deref().copied(),
+                        partition.repair().copied(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -13494,7 +13494,7 @@ mod partition_repair_driver_tests {
             .partitions()
             .get_by_ns(&namespace)
             .is_some_and(|partition| {
-                partition.transfer.is_some()
+                partition.transfer().is_some()
                     || partition.consensus().state_transfer_stage()
                         != consensus::StateTransferStage::Idle
             })
@@ -13521,7 +13521,7 @@ mod partition_repair_driver_tests {
                 .partitions()
                 .get_by_ns(&namespace)
                 .unwrap()
-                .repair
+                .repair()
                 .is_none(),
             "resident operations must not consume a repair session while waiting for the next walk"
         );
@@ -13974,7 +13974,7 @@ mod partition_repair_driver_tests {
                 .plane
                 .partitions()
                 .get_by_ns(&namespace)
-                .is_some_and(|partition| partition.repair.is_some());
+                .is_some_and(|partition| partition.repair().is_some());
             if transfer_armed(&sim, LAGGING, namespace) {
                 break;
             }
@@ -14436,7 +14436,7 @@ mod partition_repair_driver_tests {
                 .get_by_ns(&namespace)
                 .expect("the replica hosts the group");
             assert!(
-                partition.repair.is_none(),
+                partition.repair().is_none(),
                 "a session was already open, so this sweep would arm nothing"
             );
             partition.gap_ticks.set(u32::MAX);
@@ -14449,7 +14449,7 @@ mod partition_repair_driver_tests {
             .get_by_ns(&namespace)
             .expect("the replica hosts the group");
         assert!(
-            partition.repair.is_some(),
+            partition.repair().is_some(),
             "the sweep never opened a session, so the reset below proves nothing"
         );
         assert_eq!(
@@ -18287,7 +18287,7 @@ mod applied_divergence_resync_tests {
         {
             let partitions = shard.plane.partitions();
             let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-            partition.transfer = Some(Box::new(PartitionTransferSession {
+            partition.set_transfer(Some(PartitionTransferSession {
                 nonce: TRANSFER_NONCE,
                 peer: 0,
                 commit_op: 0,
