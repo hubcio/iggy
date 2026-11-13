@@ -1990,6 +1990,7 @@ where
     /// cursor the leading groups would spend the whole budget on every pass and
     /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
     partition_walk_cursor: Cell<Option<IggyNamespace>>,
+    primary_handoff: RefCell<primary_rebalance::PrimaryHandoff>,
     replication_replay_cursor: Cell<Option<(u64, u8)>>,
     /// Namespaces whose report to shard 0 changed, oldest first, each once:
     /// [`partitions::SentReport::queued`] marks the queued ones.
@@ -2276,6 +2277,7 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            primary_handoff: RefCell::default(),
             replication_replay_cursor: Cell::new(None),
             partition_reports_queued: RefCell::default(),
             partition_retractions: RefCell::default(),
@@ -3239,6 +3241,7 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            primary_handoff: RefCell::default(),
             replication_replay_cursor: Cell::new(None),
             partition_reports_queued: RefCell::default(),
             partition_retractions: RefCell::default(),
@@ -5647,6 +5650,7 @@ where
         ) else {
             return;
         };
+        self.note_group_given_up(partition.consensus(), &header);
         if header.view == partition.consensus().view() && partition.consensus().is_normal() {
             return;
         }

@@ -51,9 +51,10 @@ use crate::boot::recovery::{
     RecoveredOwnerState, ShardBuild, build_shard_for_thread, restore_metadata_consensus,
 };
 use crate::boot::threads::{
-    PeerExitCountdown, PeerExitWait, ShutdownDeadline, StopSignals, await_pump_drain,
-    install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments, run_shard_thread,
-    spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
+    PeerExitCountdown, PeerExitWait, PrimaryHandoffGate, ShutdownDeadline, StopSignals,
+    await_pump_drain, install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments,
+    run_shard_thread, spawn_primary_handoff, spawn_shutdown_watchdog,
+    validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
@@ -342,6 +343,12 @@ pub fn bootstrap(
             .get_duration()
             .saturating_add(config.sharding.shutdown_poll_interval.get_duration()),
     ));
+    let primary_handoff = Arc::new(PrimaryHandoffGate::new(
+        config
+            .sharding
+            .shutdown_primary_handoff_timeout
+            .get_duration(),
+    ));
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
     // shard's installer / disconnect path writes.
@@ -443,6 +450,7 @@ pub fn bootstrap(
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
+        let primary_handoff_for_shard = Arc::clone(&primary_handoff);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -465,6 +473,7 @@ pub fn bootstrap(
                     shard_metrics_for_shard,
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
+                    primary_handoff_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -514,6 +523,7 @@ pub fn bootstrap(
         shard_threads,
         deadline: shutdown_deadline,
         first_panic,
+        primary_handoff,
     })
 }
 
@@ -540,6 +550,7 @@ async fn shard_main(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
+    primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -1175,6 +1186,17 @@ async fn shard_main(
         bus.track_background(handle);
         stop_signals.sysinfo_printer = Some(stop_tx);
     }
+
+    // Only here, so a stop during boot starts the shutdown at once. A single
+    // node has no member to hand a partition to.
+    let _primary_handoff = (topology.replica_count > 1 && primary_handoff.enabled()).then(|| {
+        spawn_primary_handoff(
+            Rc::clone(&shard),
+            primary_handoff,
+            Arc::clone(&shutdown_flag_for_handoff),
+            poll_interval,
+        )
+    });
 
     bus.token().wait().await;
     #[cfg(feature = "systemd")]

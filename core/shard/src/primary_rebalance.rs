@@ -23,6 +23,10 @@
 //! The source bounds that drain to `GRANT_TIMEOUT` after receipt. Authority
 //! loss after receipt does not revoke an accepted grant, so the worst case is
 //! one extra move per grant that left.
+//!
+//! A node that leaves needs no coordinator: each of its shards hands the
+//! partitions it leads to a member that keeps up, through the same drain, and
+//! the node refuses every probe so that no primary comes back to it.
 
 use crate::commit_batch;
 use crate::shards_table::calculate_shard_assignment;
@@ -32,14 +36,14 @@ use crate::{
     refresh_partition_dvc_suffix, split_local_actions,
 };
 use consensus::{
-    Consensus, MetadataHandle, PartitionsHandle, QUORUM_REPLICATION_MAX, VsrConsensus,
+    Consensus, MetadataHandle, PartitionsHandle, QUORUM_REPLICATION_MAX, Status, VsrConsensus,
 };
 use iggy_binary_protocol::primitives::partition_status::{
     PartitionStatusEntry, encode_status_entries,
 };
 use iggy_binary_protocol::{
     Command, CommitEntry, ConsensusHeader, HEADER_SIZE, PrepareHeader, PrimaryRebalanceHeader,
-    PrimaryRebalanceKind,
+    PrimaryRebalanceKind, StartViewChangeHeader,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -80,6 +84,8 @@ const REBALANCE_MOVES_INFLIGHT_MAX: usize = STATUS_ENTRIES_PER_FRAME;
 /// Directory reports one probe batch visits while skipping those of deleted
 /// incarnations.
 const STATUS_ENTRIES_SCANNED_PER_FRAME: usize = 4 * STATUS_ENTRIES_PER_FRAME;
+/// Nodes the in-sync mask of a partition can name.
+const HANDOFF_NODES: usize = u32::BITS as usize;
 /// Directory reports one retain pass checks under the directory lock.
 const DIRECTORY_RETAIN_CHUNK: usize = 1024;
 /// Partitions one tick of the replication count visits, so its read stays
@@ -247,6 +253,30 @@ pub struct PrimaryRebalance {
     /// cannot hear in time, and only a lost view shows it. Moving to it again
     /// at once would repeat the view changes forever.
     backoffs: Vec<TargetBackoff>,
+}
+
+/// How far a node that leaves got in giving up the partitions it leads.
+#[derive(Debug, Default)]
+pub enum PrimaryHandoff {
+    /// The node stays.
+    #[default]
+    Off,
+    /// One pass over the partitions the shard held when the node began to
+    /// leave.
+    Walking {
+        /// Partitions the pass has not visited.
+        remaining: Vec<IggyNamespace>,
+        /// Partitions whose handoff started and still needs this node, each
+        /// with the time after which the pass stops waiting for it.
+        handed_off: Vec<(IggyNamespace, Instant)>,
+        /// Partitions each node took, so the members of a group share them.
+        given: [u32; HANDOFF_NODES],
+        /// Peers that hand a partition to this node, one bit per node. They
+        /// leave too, so they get none.
+        leaving: u32,
+    },
+    /// The pass visited every partition, and its view changes ended.
+    Done,
 }
 
 struct MovedPrimary {
@@ -483,6 +513,75 @@ impl Default for PrimaryRebalance {
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// A node that leaves gives up the partitions this shard leads before its
+    /// bus shuts down, so that no group waits for a heartbeat timeout. The
+    /// pump does the work on its ticks, see `tick_primary_handoff`.
+    pub fn begin_primary_handoff(&self) {
+        let mut handoff = self.primary_handoff.borrow_mut();
+        if matches!(*handoff, PrimaryHandoff::Off) {
+            *handoff = PrimaryHandoff::Walking {
+                remaining: self.plane.partitions().namespaces().copied().collect(),
+                handed_off: Vec::new(),
+                given: [0; HANDOFF_NODES],
+                leaving: 0,
+            };
+        }
+    }
+
+    /// Whether the handoff still has a partition to visit or a view change of
+    /// its own to wait for.
+    pub fn primary_handoff_pending(&self) -> bool {
+        matches!(
+            *self.primary_handoff.borrow(),
+            PrimaryHandoff::Walking { .. }
+        )
+    }
+
+    /// A node that leaves takes no primary: not from a move, and not as the
+    /// first primary of a new partition.
+    fn is_leaving(&self) -> bool {
+        !matches!(*self.primary_handoff.borrow(), PrimaryHandoff::Off)
+    }
+
+    /// Takes the sender of `vote` for a node that leaves, if it is the primary
+    /// of the group and its vote gives the group to this node.
+    ///
+    /// The coordinator moves no primary to a node that leaves, so a primary
+    /// that gives a group to this node during the pass hands it off: that peer
+    /// leaves too, and it gets no partition from this node. Without this,
+    /// nodes that stop at the same time hand their partitions to each other
+    /// until the timeout.
+    ///
+    /// A move granted just before this node began to leave, a primary that
+    /// steps down for another reason, or a view that this replica missed makes
+    /// a peer that stays look like one that leaves. If no other target is
+    /// left, the partitions of this shard wait for a heartbeat timeout, as
+    /// they did before the handoff existed.
+    pub(crate) fn note_group_given_up(
+        &self,
+        consensus: &VsrConsensus<B>,
+        vote: &StartViewChangeHeader,
+    ) {
+        let mut handoff = self.primary_handoff.borrow_mut();
+        let PrimaryHandoff::Walking { leaving, .. } = &mut *handoff else {
+            return;
+        };
+        // The first test also proves that `vote.replica` is a member.
+        if consensus.primary_index(consensus.log_view()) == vote.replica
+            && consensus.is_primary_for_view(vote.view)
+        {
+            *leaving |= 1_u32
+                .checked_shl(u32::from(consensus.member_node(vote.replica)))
+                .unwrap_or(0);
+        }
+    }
+}
+
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
     B: MessageBus + 'static,
     SB: SuperblockStore,
     MJ: JournalHandle,
@@ -593,10 +692,13 @@ where
             let admission_opened = state.admission_opened;
             for replica in 0..consensus.replica_count() {
                 let index = usize::from(replica);
-                let ready = replica == consensus.replica()
-                    || state.peers[index]
+                let ready = if replica == consensus.replica() {
+                    !self.is_leaving()
+                } else {
+                    state.peers[index]
                         .ready_at
-                        .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT);
+                        .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT)
+                };
                 if state.eligible[index] != ready {
                     state.eligible[index] = ready;
                     changed = true;
@@ -863,7 +965,8 @@ where
     }
 
     /// Node id of the primary `view` assigns in the committed partition behind
-    /// `namespace`.
+    /// `namespace`. `None` on a shard with no metadata group, so only the
+    /// coordinator asks. A shard asks the consensus of its own partition.
     fn partition_primary_node(&self, namespace: u64, view: u32) -> Option<u8> {
         let nodes = self.plane.metadata().consensus.as_ref()?.replica_count();
         let members = self
@@ -988,7 +1091,8 @@ where
                 };
                 reply.ready = u8::from(
                     header.kind == PrimaryRebalanceKind::MetadataProbe
-                        && consensus_ready(consensus),
+                        && consensus_ready(consensus)
+                        && !self.is_leaving(),
                 );
                 if header.kind == PrimaryRebalanceKind::MetadataProbe {
                     let (statuses, unsent) = self.next_reported_statuses();
@@ -1135,7 +1239,8 @@ where
                 let namespace = IggyNamespace::from_raw(header.namespace);
                 let partition = self.plane.partitions().get_by_ns(&namespace);
                 header.ready = u8::from(partition.is_some_and(|partition| {
-                    self.rebalance_incarnation_current(namespace, header.created_revision)
+                    !self.is_leaving()
+                        && self.rebalance_incarnation_current(namespace, header.created_revision)
                         && if capture {
                             partition_history_ready(partition, &header)
                                 && partition.consensus().is_primary()
@@ -1202,6 +1307,119 @@ where
         let (local, wire) = split_local_actions(actions);
         dispatch_partition_journal_actions(consensus, partition, &local).await;
         dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire).await;
+    }
+
+    /// One step of the pass that gives up the partitions this shard leads.
+    ///
+    /// Each partition goes to the in-sync member that took the fewest so far.
+    /// A tie goes to the member that an election would pick. The pass visits a
+    /// partition once: peers that leave at the same time hand partitions to
+    /// this node, and a second pass would send them around.
+    ///
+    /// Each handoff is a view change through the partition I/O lane, so the
+    /// limits on heartbeat votes pace the pass.
+    pub(crate) fn tick_primary_handoff(&self) {
+        let mut handoff = self.primary_handoff.borrow_mut();
+        let PrimaryHandoff::Walking {
+            remaining,
+            handed_off,
+            given,
+            leaving,
+        } = &mut *handoff
+        else {
+            return;
+        };
+        let partitions = self.plane.partitions();
+        let now = self.bus.monotonic_now();
+        // The node waits for its own handoffs only. A view change that a peer
+        // started ends without it, and one that lost its quorum never ends.
+        // A target that cannot lead yet, such as a peer that restarted and
+        // still probes for the view, holds its view change until the status
+        // timeout. So the wait for each handoff has its own deadline.
+        handed_off.retain(|(namespace, wait_until)| {
+            now < *wait_until
+                && partitions.get_by_ns(namespace).is_some_and(|partition| {
+                    let consensus = partition.consensus();
+                    // A view change whose next primary went away cannot end
+                    // before the status timeout.
+                    partition.primary_transfer_pending()
+                        || (consensus.status() == Status::ViewChange
+                            && self
+                                .bus
+                                .replica_is_up(consensus.primary_node(consensus.view())))
+                })
+        });
+        // Every view change of the shard loads the I/O lane, whoever started it.
+        let mut inflight = partitions
+            .namespaces()
+            .filter_map(|namespace| partitions.get_by_ns(namespace))
+            .filter(|partition| {
+                partition.primary_transfer_pending()
+                    || partition.consensus().status() == Status::ViewChange
+            })
+            .count();
+        let mut started = 0usize;
+        while let Some(&namespace) = remaining.last() {
+            if started == crate::PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX
+                || inflight >= crate::PARTITION_VIEW_CHANGES_INFLIGHT_MAX
+            {
+                return;
+            }
+            remaining.pop();
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            let own = 1_u32
+                .checked_shl(u32::from(consensus.node_id()))
+                .unwrap_or(0);
+            let Some(target) =
+                consensus
+                    .in_sync_nodes(consensus::MEMBER_LAG_MAX)
+                    .and_then(|nodes| {
+                        least_given(consensus, self.links_up(nodes & !own & !*leaving), given)
+                    })
+            else {
+                continue;
+            };
+            let expires_at = now + GRANT_TIMEOUT;
+            let request = PreparedPrimaryTransfer {
+                created_revision: partition.created_revision(),
+                expected_view: consensus.view(),
+                target,
+                expires_at,
+            };
+            if self.rebalance_incarnation_current(namespace, request.created_revision)
+                && partition.defer_primary_transfer(request)
+            {
+                given[usize::from(target)] += 1;
+                started += 1;
+                inflight += 1;
+                // The transfer starts before it expires, and its view change
+                // gets one more grant to end.
+                handed_off.push((namespace, expires_at + GRANT_TIMEOUT));
+            }
+        }
+        if !handed_off.is_empty() {
+            return;
+        }
+        // A request that expires in its drain, or whose target goes away,
+        // moves no primary, so this is not the number that moved.
+        tracing::info!(
+            shard = self.id,
+            requested = given.iter().sum::<u32>(),
+            "ended the primary handoff of this shard before shutdown"
+        );
+        *handoff = PrimaryHandoff::Done;
+    }
+
+    /// The nodes of `nodes` that frames reach now. The in-sync mask of a quiet
+    /// group still names a node that went away after its last heartbeat.
+    fn links_up(&self, nodes: u32) -> u32 {
+        (0..u8::MAX)
+            .take(HANDOFF_NODES)
+            .filter(|node| nodes & (1 << node) != 0 && self.bus.replica_is_up(*node))
+            .fold(0, |up, node| up | (1 << node))
     }
 
     fn rebalance_incarnation_current(&self, namespace: IggyNamespace, revision: u64) -> bool {
@@ -1395,6 +1613,25 @@ fn node_mask(eligible: &[bool]) -> u32 {
         .filter_map(|(node, _)| u32::try_from(node).ok())
         .filter_map(|node| 1_u32.checked_shl(node))
         .fold(0, |mask, bit| mask | bit)
+}
+
+/// The node of `nodes` that took the fewest partitions of the pass. A tie goes
+/// to the node that leads first after the current view of `consensus`, so a
+/// lone group lands where an election would put it.
+fn least_given<B: MessageBus>(
+    consensus: &VsrConsensus<B>,
+    nodes: u32,
+    given: &[u32; HANDOFF_NODES],
+) -> Option<u8> {
+    (1..=u32::from(consensus.replica_count()))
+        .filter_map(|ahead| consensus.view().checked_add(ahead))
+        .map(|view| consensus.primary_node(view))
+        .filter(|&node| {
+            1_u32
+                .checked_shl(u32::from(node))
+                .is_some_and(|bit| nodes & bit != 0)
+        })
+        .min_by_key(|&node| given[usize::from(node)])
 }
 
 pub fn consensus_ready<B: MessageBus>(consensus: &VsrConsensus<B>) -> bool {
