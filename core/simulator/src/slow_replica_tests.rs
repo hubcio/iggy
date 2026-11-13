@@ -79,6 +79,11 @@ const PARTITION_TICKS: u64 = 10 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS;
 const ELECTION_TICKS_MAX: u64 = TimeoutManager::NORMAL_HEARTBEAT_TICKS
     + TimeoutManager::COMMIT_MESSAGE_TICKS
     + TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS;
+/// Groups that all start on replica 0, so the rebalancer owes 40 moves.
+const BULK_GROUPS: usize = 60;
+/// The 5 s that the rebalancer waits for a stable cluster, then 10 probe
+/// intervals of 1 s.
+const BULK_SPREAD_TICKS: u64 = 1_500;
 /// Groups that replica 0 leads from their start. No write tells them apart,
 /// so their heartbeats leave on the same ticks.
 const MANY_GROUPS: usize = 24;
@@ -407,6 +412,37 @@ fn given_a_crashed_primary_of_many_groups_should_hold_votes_and_change_each_view
         vec![Some(view + 1); MANY_GROUPS],
         "the view in which a survivor first led each group"
     );
+}
+
+/// The rebalancer plans a round of moves per probe interval. One move per
+/// interval needs 40 intervals to spread these groups, and the test gives 10.
+#[test]
+fn given_many_groups_on_one_replica_when_rebalancing_should_spread_them_in_a_few_rounds() {
+    let mut run = Run::new(BULK_GROUPS, 0);
+    assert!(
+        run.namespaces
+            .iter()
+            .all(|&namespace| run.sim.primary_index(namespace) == Some(LEADER)),
+        "replica 0 must lead every group at the start"
+    );
+
+    let replies: u64 = (0..BULK_SPREAD_TICKS).map(|_| run.tick()).sum();
+
+    let mut led = [0_usize; 3];
+    for &namespace in &run.namespaces {
+        let primary = run.sim.primary_index(namespace).expect("a primary");
+        led[usize::from(primary)] += 1;
+    }
+    assert_eq!(led, [BULK_GROUPS / 3; 3], "groups that each replica leads");
+    // The primary of view 1 or 2 is replica 1 or 2, so a higher view shows a
+    // group that moved a second time.
+    let moved_twice: Vec<_> = run
+        .namespaces
+        .iter()
+        .filter(|&&namespace| healthy_view(&run.sim, namespace) > 2)
+        .collect();
+    assert!(moved_twice.is_empty(), "{moved_twice:?}");
+    assert!(replies > 0, "the workload must keep committing");
 }
 
 #[test]

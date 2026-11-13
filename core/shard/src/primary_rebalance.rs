@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The metadata primary coordinates one partition view change at a time.
+//! The metadata primary coordinates partition view changes in rounds of up to
+//! `REBALANCE_MOVES_INFLIGHT_MAX` moves.
 //! Moves require fresh challenges, and a transfer additionally requires
 //! the target's applied partition prefix. The grant then goes to the source
 //! primary, because only its drain fences the replica where prepares start.
 //! The source bounds that drain to `GRANT_TIMEOUT` after receipt. Authority
 //! loss after receipt does not revoke an accepted grant, so the worst case is
-//! one extra move.
+//! one extra move per grant that left.
 
 use crate::commit_batch;
 use crate::shards_table::calculate_shard_assignment;
@@ -71,6 +72,11 @@ const MOVE_HOLD_INTERVAL: Duration = Duration::from_secs(30);
 const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(240);
 /// Partition reports one metadata probe or reply carries.
 const STATUS_ENTRIES_PER_FRAME: usize = 512;
+/// Moves the coordinator has planned, probed or granted at one time. A move
+/// ends with the report of its new view, and one reply of the target carries
+/// `STATUS_ENTRIES_PER_FRAME` reports per probe interval, so a larger round
+/// would only wait for its reports.
+const REBALANCE_MOVES_INFLIGHT_MAX: usize = STATUS_ENTRIES_PER_FRAME;
 /// Directory reports one probe batch visits while skipping those of deleted
 /// incarnations.
 const STATUS_ENTRIES_SCANNED_PER_FRAME: usize = 4 * STATUS_ENTRIES_PER_FRAME;
@@ -224,7 +230,8 @@ pub struct PrimaryRebalance {
     stable_since: Instant,
     next_move: Instant,
     cursor: Option<IggyNamespace>,
-    pending: Option<PendingMove>,
+    /// Moves planned, probed or granted whose new view no report shows yet.
+    pending: BTreeMap<IggyNamespace, PendingMove>,
     /// Identity and local receipt time of the newest accepted metadata probe.
     received_probe: Option<((u32, u64, u128), Instant)>,
     /// When this node's partition admission last opened under this authority.
@@ -233,6 +240,9 @@ pub struct PrimaryRebalance {
     /// Moves a source carried out, watched until the target holds the
     /// partition for `MOVE_HOLD_INTERVAL` or loses it to a view change.
     moves: Vec<MovedPrimary>,
+    /// A round fills `moves` with thousands of entries, so they are judged
+    /// once per probe interval instead of on every tick.
+    next_watch: Instant,
     /// Per replica. A target ready for a move can still be one that a backup
     /// cannot hear in time, and only a lost view shows it. Moving to it again
     /// at once would repeat the view changes forever.
@@ -367,13 +377,13 @@ impl PrimaryRebalance {
     }
 
     /// A grant the bus refused never reached the source, so no view change can
-    /// follow it. The move ends at once instead of holding the next one until
-    /// the transfer timeout.
-    fn forget_unsent_grant(&mut self, nonce: u128) {
-        if self.pending.as_ref().is_some_and(|pending| {
+    /// follow it. The move ends at once instead of holding its place until the
+    /// transfer timeout.
+    fn forget_unsent_grant(&mut self, namespace: IggyNamespace, nonce: u128) {
+        if self.pending.get(&namespace).is_some_and(|pending| {
             pending.phase == MovePhase::Transfer && pending.probe.nonce == nonce
         }) {
-            self.pending = None;
+            self.pending.remove(&namespace);
         }
     }
 
@@ -432,15 +442,17 @@ impl PrimaryRebalance {
         now: Instant,
     ) -> bool {
         self.view == Some(header.view)
-            && self.pending.as_ref().is_some_and(|pending| {
-                pending.phase == phase
-                    && now.duration_since(pending.since) <= PROBE_TIMEOUT
-                    && pending.probe.nonce == header.nonce
-                    && pending.probe.namespace == header.namespace
-                    && pending.probe.created_revision == header.created_revision
-                    && pending.probe.partition_view == header.partition_view
-                    && (phase == MovePhase::Capture || pending.probe.commit == header.commit)
-            })
+            && self
+                .pending
+                .get(&IggyNamespace::from_raw(header.namespace))
+                .is_some_and(|pending| {
+                    pending.phase == phase
+                        && now.duration_since(pending.since) <= PROBE_TIMEOUT
+                        && pending.probe.nonce == header.nonce
+                        && pending.probe.created_revision == header.created_revision
+                        && pending.probe.partition_view == header.partition_view
+                        && (phase == MovePhase::Capture || pending.probe.commit == header.commit)
+                })
     }
 }
 
@@ -459,10 +471,11 @@ impl Default for PrimaryRebalance {
             stable_since: Instant::now(),
             next_move: Instant::now(),
             cursor: None,
-            pending: None,
+            pending: BTreeMap::new(),
             received_probe: None,
             admission_opened: None,
             moves: Vec::new(),
+            next_watch: Instant::now(),
             backoffs: Vec::new(),
         }
     }
@@ -537,7 +550,7 @@ where
             return;
         }
         let mut outgoing = Vec::new();
-        let mut capture = None;
+        let mut captures = Vec::new();
         let now = self.bus.monotonic_now();
         {
             let mut state = self.primary_rebalance.borrow_mut();
@@ -571,6 +584,7 @@ where
                     backoffs: vec![TargetBackoff::default(); replicas],
                     stable_since: now,
                     next_move: now,
+                    next_watch: now,
                     received_probe: state.received_probe,
                     ..PrimaryRebalance::default()
                 };
@@ -638,7 +652,7 @@ where
             };
             if changed {
                 state.stable_since = now;
-                state.pending = None;
+                state.pending.clear();
             }
             if changed || readiness_known != state.readiness_known {
                 state.readiness_known = readiness_known;
@@ -684,60 +698,64 @@ where
                     *replication = counts;
                 }
             }
-            if let Some(pending) = state.pending.as_ref() {
-                let elapsed = now.duration_since(pending.since);
+            let PrimaryRebalance { pending, moves, .. } = &mut *state;
+            pending.retain(|_, pending| {
                 let current = metadata.partition_placement_view(
                     pending.plan.namespace,
                     pending.plan.created_revision,
                 );
                 let invalid = current.is_none_or(|current| current.view != pending.plan.view);
-                let expired = elapsed
+                let expired = now.duration_since(pending.since)
                     > match pending.phase {
                         MovePhase::Capture | MovePhase::Probe => PROBE_TIMEOUT,
                         // The coordinator cannot see whether the source used the
-                        // grant. Planning before the new view shows up would
-                        // count the moved primary twice.
+                        // grant. Giving up before the new view shows up would
+                        // let a later round move the partition a second time.
                         MovePhase::Transfer => TRANSFER_TIMEOUT,
                     };
-                if invalid || expired {
-                    // The planned view ended after the grant, so watch whether
-                    // the target keeps the partition.
-                    let moved =
-                        (invalid && current.is_some() && pending.phase == MovePhase::Transfer)
-                            .then_some(pending.plan);
-                    state.pending = None;
-                    if let Some(plan) = moved {
-                        state.moves.push(MovedPrimary { plan, since: now });
-                    }
+                if !invalid && !expired {
+                    return true;
                 }
-            }
-            let PrimaryRebalance {
-                moves, backoffs, ..
-            } = &mut *state;
-            moves.retain(|moved| {
-                let target = moved.plan.target;
-                let (Some(current), Some(backoff)) = (
-                    metadata.partition_placement_view(
-                        moved.plan.namespace,
-                        moved.plan.created_revision,
-                    ),
-                    backoffs.get_mut(usize::from(target)),
-                ) else {
-                    return false;
-                };
-                if self.partition_primary_node(moved.plan.namespace.inner(), current.view)
-                    != Some(target)
-                {
-                    backoff.record_failure(now);
-                    return false;
+                // The planned view ended after the grant, so watch whether
+                // the target keeps the partition.
+                if invalid && current.is_some() && pending.phase == MovePhase::Transfer {
+                    moves.push(MovedPrimary {
+                        plan: pending.plan,
+                        since: now,
+                    });
                 }
-                if now.duration_since(moved.since) >= MOVE_HOLD_INTERVAL {
-                    *backoff = TargetBackoff::default();
-                    return false;
-                }
-                true
+                false
             });
-            if state.pending.is_none()
+            if now >= state.next_watch {
+                state.next_watch = now + PROBE_INTERVAL;
+                let PrimaryRebalance {
+                    moves, backoffs, ..
+                } = &mut *state;
+                moves.retain(|moved| {
+                    let target = moved.plan.target;
+                    let (Some(current), Some(backoff)) = (
+                        metadata.partition_placement_view(
+                            moved.plan.namespace,
+                            moved.plan.created_revision,
+                        ),
+                        backoffs.get_mut(usize::from(target)),
+                    ) else {
+                        return false;
+                    };
+                    if self.partition_primary_node(moved.plan.namespace.inner(), current.view)
+                        != Some(target)
+                    {
+                        backoff.record_failure(now);
+                        return false;
+                    }
+                    if now.duration_since(moved.since) >= MOVE_HOLD_INTERVAL {
+                        *backoff = TargetBackoff::default();
+                        return false;
+                    }
+                    true
+                });
+            }
+            if state.pending.len() < REBALANCE_MOVES_INFLIGHT_MAX
                 && now >= state.next_move
                 && now.duration_since(state.stable_since) >= STABLE_INTERVAL
             {
@@ -753,11 +771,30 @@ where
                         && state
                             .moves
                             .iter()
-                            .any(|moved| usize::from(moved.plan.target) == replica);
+                            .map(|moved| moved.plan)
+                            .chain(state.pending.values().map(|pending| pending.plan))
+                            .any(|plan| usize::from(plan.target) == replica);
                     *eligible &= !backoff.blocks(now) && !probing;
                 }
-                if let Some(plan) = metadata.primary_rebalance_candidate(&candidates, state.cursor)
+                // Each planned move joins the moves in flight, so the next
+                // pick counts it as done and the round ends in balance.
+                let mut inflight: BTreeMap<_, _> = state
+                    .pending
+                    .iter()
+                    .map(|(namespace, pending)| (*namespace, pending.plan))
+                    .collect();
+                while inflight.len() < REBALANCE_MOVES_INFLIGHT_MAX
+                    && let Some(plan) =
+                        metadata.primary_rebalance_candidate(&candidates, state.cursor, &inflight)
                 {
+                    if state
+                        .backoffs
+                        .get(usize::from(plan.target))
+                        .is_some_and(|backoff| backoff.wait > Duration::ZERO)
+                        && let Some(eligible) = candidates.get_mut(usize::from(plan.target))
+                    {
+                        *eligible = false;
+                    }
                     let mut probe =
                         probe_header(consensus, self.next_forward_nonce(consensus.replica()));
                     probe.kind = PrimaryRebalanceKind::SourceProbe;
@@ -765,20 +802,25 @@ where
                     probe.created_revision = plan.created_revision;
                     probe.partition_view = plan.view;
                     state.cursor = Some(plan.namespace);
-                    state.pending = Some(PendingMove {
-                        plan,
-                        probe,
-                        phase: MovePhase::Capture,
-                        since: now,
-                    });
-                    capture = Some(probe);
+                    inflight.insert(plan.namespace, plan);
+                    state.pending.insert(
+                        plan.namespace,
+                        PendingMove {
+                            plan,
+                            probe,
+                            phase: MovePhase::Capture,
+                            since: now,
+                        },
+                    );
+                    captures.push(probe);
                 }
             }
         }
-        if let Some(probe) = capture
-            && let Some(source) = self.partition_primary_node(probe.namespace, probe.partition_view)
-        {
-            self.send_rebalance(source, probe, &[]).await;
+        for probe in captures {
+            if let Some(source) = self.partition_primary_node(probe.namespace, probe.partition_view)
+            {
+                self.send_rebalance(source, probe, &[]).await;
+            }
         }
         for (replica, probe) in outgoing {
             let (statuses, unsent) = self.next_status_batch(replica);
@@ -1005,11 +1047,12 @@ where
                     {
                         return;
                     }
+                    let namespace = IggyNamespace::from_raw(header.namespace);
                     if header.ready == 0 {
-                        state.pending = None;
+                        state.pending.remove(&namespace);
                         return;
                     }
-                    let Some(pending) = state.pending.as_mut() else {
+                    let Some(pending) = state.pending.get_mut(&namespace) else {
                         return;
                     };
                     pending.probe.commit = header.commit;
@@ -1026,19 +1069,20 @@ where
                 }
                 let outgoing = {
                     let mut state = self.primary_rebalance.borrow_mut();
+                    let namespace = IggyNamespace::from_raw(header.namespace);
                     if !state.matches_pending(&header, MovePhase::Probe, now)
                         || state
                             .pending
-                            .as_ref()
+                            .get(&namespace)
                             .is_none_or(|pending| pending.plan.target != header.replica)
                     {
                         return;
                     }
                     if header.ready == 0 {
-                        state.pending = None;
+                        state.pending.remove(&namespace);
                         return;
                     }
-                    let Some(pending) = state.pending.as_mut() else {
+                    let Some(pending) = state.pending.get_mut(&namespace) else {
                         return;
                     };
                     pending.probe.kind = PrimaryRebalanceKind::PrimaryTransfer;
@@ -1054,9 +1098,10 @@ where
                     return;
                 };
                 if !self.send_rebalance(source, outgoing.1, &[]).await {
-                    self.primary_rebalance
-                        .borrow_mut()
-                        .forget_unsent_grant(outgoing.1.nonce);
+                    self.primary_rebalance.borrow_mut().forget_unsent_grant(
+                        IggyNamespace::from_raw(outgoing.1.namespace),
+                        outgoing.1.nonce,
+                    );
                 }
             }
             PrimaryRebalanceKind::PrimaryTransfer => {

@@ -197,17 +197,20 @@ fn arm<SB: SuperblockStore>(shard: &TestShard<SB>, phase: MovePhase) -> PrimaryR
         peers: vec![Peer::default(); usize::from(REPLICAS)],
         eligible: vec![true; usize::from(REPLICAS)],
         backoffs: vec![TargetBackoff::default(); usize::from(REPLICAS)],
-        pending: Some(PendingMove {
-            plan: PartitionPrimaryTransfer {
-                namespace,
-                created_revision: CREATED_REVISION,
-                view: PARTITION_VIEW,
-                target: TARGET,
+        pending: BTreeMap::from([(
+            namespace,
+            PendingMove {
+                plan: PartitionPrimaryTransfer {
+                    namespace,
+                    created_revision: CREATED_REVISION,
+                    view: PARTITION_VIEW,
+                    target: TARGET,
+                },
+                probe,
+                phase,
+                since: Instant::now(),
             },
-            probe,
-            phase,
-            since: Instant::now(),
-        }),
+        )]),
         ..PrimaryRebalance::default()
     };
     probe.kind = if phase == MovePhase::Capture {
@@ -253,7 +256,8 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
                     .primary_rebalance
                     .borrow_mut()
                     .pending
-                    .as_mut()
+                    .values_mut()
+                    .next()
                     .unwrap()
                     .since = Instant::now()
                     .checked_sub(PROBE_TIMEOUT + PROBE_INTERVAL)
@@ -272,7 +276,8 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
                 .primary_rebalance
                 .borrow()
                 .pending
-                .as_ref()
+                .values()
+                .next()
                 .is_some_and(|pending| pending.phase == MovePhase::Probe)
         );
     }
@@ -386,7 +391,7 @@ async fn given_the_coordinator_leads_the_partition_when_target_confirms_it_shoul
     assert_eq!(consensus.primary_index(led_view), consensus.replica());
     {
         let mut state = shard.primary_rebalance.borrow_mut();
-        let pending = state.pending.as_mut().unwrap();
+        let pending = state.pending.values_mut().next().unwrap();
         pending.plan.view = led_view;
         pending.probe.partition_view = led_view;
     }
@@ -424,7 +429,7 @@ async fn given_target_rejection_when_reply_is_correlated_should_drop_the_move_an
     let mut reply = arm(&shard, MovePhase::Probe);
     reply.ready = 0;
     shard.on_primary_rebalance(reply, Vec::new()).await;
-    assert!(shard.primary_rebalance.borrow().pending.is_none());
+    assert!(shard.primary_rebalance.borrow().pending.is_empty());
     reply.ready = 1;
     shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(inbox.try_recv().is_err());
@@ -464,11 +469,11 @@ async fn given_a_sent_grant_when_the_new_view_is_unseen_should_hold_the_move_unt
         let sent_at = shard.bus.monotonic_now();
         {
             let mut state = shard.primary_rebalance.borrow_mut();
-            let pending = state.pending.as_mut().unwrap();
+            let pending = state.pending.values_mut().next().unwrap();
             pending.plan.created_revision = created_revision;
             pending.since = sent_at;
         }
-        let pending = || shard.primary_rebalance.borrow().pending.is_some();
+        let pending = || !shard.primary_rebalance.borrow().pending.is_empty();
 
         tick_with_ready_peers(&shard, sent_at + GRANT_TIMEOUT * 2).await;
         assert!(
@@ -547,7 +552,7 @@ async fn given_a_move_inside_a_subset_group_when_the_target_holds_should_reset_i
     let moved_at = shard.bus.monotonic_now();
     {
         let mut state = shard.primary_rebalance.borrow_mut();
-        let pending = state.pending.as_mut().unwrap();
+        let pending = state.pending.values_mut().next().unwrap();
         pending.plan.created_revision = created_revision;
         pending.since = moved_at;
         state.backoffs[usize::from(TARGET)] = TargetBackoff {
@@ -597,7 +602,7 @@ async fn given_a_backed_off_target_when_its_probe_move_is_lost_or_held_should_do
         let moved_at = shard.bus.monotonic_now();
         {
             let mut state = shard.primary_rebalance.borrow_mut();
-            let pending = state.pending.as_mut().unwrap();
+            let pending = state.pending.values_mut().next().unwrap();
             pending.plan.created_revision = created_revision;
             pending.since = moved_at;
             // The wait after one failed move ran out, so this move probes the target.
@@ -652,7 +657,8 @@ async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_befo
         .primary_rebalance
         .borrow_mut()
         .pending
-        .as_mut()
+        .values_mut()
+        .next()
         .unwrap()
         .plan
         .created_revision = views[0].created_revision;
@@ -674,6 +680,210 @@ async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_befo
             .any(|(replica, probe)| *replica == SOURCE
                 && probe.kind == PrimaryRebalanceKind::SourceProbe),
         "the coordinator must plan again before the transfer timeout"
+    );
+}
+
+/// A coordinator that planned no move yet, with `partitions` observed
+/// partitions that `SOURCE` leads.
+fn coordinator_with_primaries_on_source(partitions: usize) -> (TestShard, Receiver<ShardFrame>) {
+    let (shard, inbox) = owner();
+    arm(&shard, MovePhase::Capture);
+    shard.primary_rebalance.borrow_mut().pending.clear();
+    let metadata = shard.plane.metadata();
+    let streams = metadata.mux_stm.streams();
+    let last = IggyNamespace::new(1, 1, partitions - 1);
+    streams.seed_namespace(last, last.inner(), PARTITION_VIEW);
+    let views: Vec<_> = (0..partitions)
+        .map(|partition| {
+            let namespace = IggyNamespace::new(1, 1, partition);
+            PartitionPlacementView {
+                namespace,
+                created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+                view: PARTITION_VIEW,
+            }
+        })
+        .collect();
+    metadata.observe_partition_views(&views);
+    (shard, inbox)
+}
+
+/// How many planned moves go to `target`.
+fn planned_to(shard: &TestShard, target: u8) -> usize {
+    let state = shard.primary_rebalance.borrow();
+    state
+        .pending
+        .values()
+        .filter(|pending| pending.plan.target == target)
+        .count()
+}
+
+fn source_probes_sent(shard: &TestShard) -> usize {
+    let sent = shard.bus.sent.borrow();
+    sent.iter()
+        .filter(|(replica, probe)| {
+            *replica == SOURCE && probe.kind == PrimaryRebalanceKind::SourceProbe
+        })
+        .count()
+}
+
+#[compio::test]
+async fn given_every_primary_on_one_node_when_the_coordinator_ticks_should_plan_one_round_that_ends_in_balance()
+ {
+    const PARTITIONS: usize = 12;
+    const MOVES: usize = PARTITIONS - PARTITIONS / REPLICAS as usize;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    let planned_at = shard.bus.monotonic_now() + STABLE_INTERVAL * 2;
+
+    tick_with_ready_peers(&shard, planned_at).await;
+
+    assert_eq!(
+        (
+            planned_to(&shard, 0),
+            planned_to(&shard, SOURCE),
+            planned_to(&shard, TARGET)
+        ),
+        (MOVES / 2, 0, MOVES / 2),
+        "moves planned to each node"
+    );
+    assert_eq!(source_probes_sent(&shard), MOVES);
+
+    // The moves in flight count as done, so the next round plans nothing.
+    shard.bus.sent.borrow_mut().clear();
+    tick_with_ready_peers(&shard, planned_at + PROBE_INTERVAL).await;
+    assert_eq!(shard.primary_rebalance.borrow().pending.len(), MOVES);
+    assert_eq!(source_probes_sent(&shard), 0);
+}
+
+#[compio::test]
+async fn given_more_moves_than_the_inflight_limit_when_some_end_should_plan_up_to_the_limit_again()
+{
+    const PARTITIONS: usize = 3 * REBALANCE_MOVES_INFLIGHT_MAX + 3;
+    const ENDED: usize = 5;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    let planned_at = shard.bus.monotonic_now() + STABLE_INTERVAL * 2;
+
+    tick_with_ready_peers(&shard, planned_at).await;
+
+    assert_eq!(
+        shard.primary_rebalance.borrow().pending.len(),
+        REBALANCE_MOVES_INFLIGHT_MAX
+    );
+    assert_eq!(source_probes_sent(&shard), REBALANCE_MOVES_INFLIGHT_MAX);
+
+    // A report shows the target of each ended move as its primary.
+    let ended: Vec<_> = shard
+        .primary_rebalance
+        .borrow()
+        .pending
+        .values()
+        .take(ENDED)
+        .map(|pending| pending.plan)
+        .collect();
+    let nodes = u32::from(REPLICAS);
+    let views: Vec<_> = ended
+        .iter()
+        .map(|plan| PartitionPlacementView {
+            namespace: plan.namespace,
+            created_revision: plan.created_revision,
+            view: plan.view + (u32::from(plan.target) + nodes - plan.view % nodes) % nodes,
+        })
+        .collect();
+    shard.plane.metadata().observe_partition_views(&views);
+    shard.bus.sent.borrow_mut().clear();
+    tick_with_ready_peers(&shard, planned_at + PROBE_INTERVAL).await;
+
+    let state = shard.primary_rebalance.borrow();
+    assert_eq!(state.pending.len(), REBALANCE_MOVES_INFLIGHT_MAX);
+    assert!(
+        ended
+            .iter()
+            .all(|plan| !state.pending.contains_key(&plan.namespace)),
+        "a partition that moved must not move again"
+    );
+    drop(state);
+    assert_eq!(source_probes_sent(&shard), ENDED);
+}
+
+#[compio::test]
+async fn given_a_round_of_moves_when_replies_arrive_out_of_order_should_advance_each_move_alone() {
+    const PARTITIONS: usize = 12;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    tick_with_ready_peers(&shard, shard.bus.monotonic_now() + STABLE_INTERVAL * 2).await;
+    let planned: Vec<_> = shard
+        .primary_rebalance
+        .borrow()
+        .pending
+        .values()
+        .map(|pending| (pending.plan, pending.probe))
+        .collect();
+    let source_reply = |probe: PrimaryRebalanceHeader, ready: u8| PrimaryRebalanceHeader {
+        kind: PrimaryRebalanceKind::SourceReply,
+        replica: SOURCE,
+        commit: COMMITTED,
+        ready,
+        ..probe
+    };
+    let (ready, refused, stale, untouched) = (planned[7], planned[2], planned[4], planned[0]);
+    shard.bus.sent.borrow_mut().clear();
+
+    shard
+        .on_primary_rebalance(source_reply(ready.1, 1), Vec::new())
+        .await;
+    shard
+        .on_primary_rebalance(source_reply(refused.1, 0), Vec::new())
+        .await;
+    let mut other_nonce = source_reply(stale.1, 1);
+    other_nonce.nonce += 1;
+    shard.on_primary_rebalance(other_nonce, Vec::new()).await;
+
+    let phase = |plan: PartitionPrimaryTransfer| {
+        let state = shard.primary_rebalance.borrow();
+        state
+            .pending
+            .get(&plan.namespace)
+            .map(|pending| pending.phase)
+    };
+    assert!(phase(ready.0) == Some(MovePhase::Probe));
+    assert!(phase(refused.0).is_none());
+    assert!(phase(stale.0) == Some(MovePhase::Capture));
+    assert!(phase(untouched.0) == Some(MovePhase::Capture));
+    let sent = shard.bus.sent.borrow();
+    assert_eq!(sent.len(), 1, "only the ready move probes its target");
+    assert_eq!(
+        (sent[0].0, sent[0].1.kind, sent[0].1.namespace),
+        (
+            ready.0.target,
+            PrimaryRebalanceKind::PartitionProbe,
+            ready.0.namespace.inner()
+        )
+    );
+}
+
+/// A target whose wait after a failed move ran out is on probation: it gets
+/// one move, and no second one before the first holds.
+#[compio::test]
+async fn given_a_backed_off_target_when_planning_rounds_should_give_it_one_move_at_a_time() {
+    const PARTITIONS: usize = 12;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    let planned_at = shard.bus.monotonic_now() + STABLE_INTERVAL * 2;
+    shard.primary_rebalance.borrow_mut().backoffs[usize::from(TARGET)] = TargetBackoff {
+        until: Some(shard.bus.monotonic_now()),
+        wait: MOVE_HOLD_INTERVAL,
+    };
+
+    tick_with_ready_peers(&shard, planned_at).await;
+
+    // Without the target, the source and node 0 end one apart.
+    let to_other = (PARTITIONS - 1) / 2;
+    assert_eq!(
+        (planned_to(&shard, TARGET), planned_to(&shard, 0)),
+        (1, to_other)
+    );
+
+    tick_with_ready_peers(&shard, planned_at + PROBE_INTERVAL).await;
+    assert_eq!(
+        (planned_to(&shard, TARGET), planned_to(&shard, 0)),
+        (1, to_other)
     );
 }
 
@@ -708,7 +918,7 @@ async fn given_pending_target_probe_when_metadata_authority_changes_should_not_g
         "a reply handled during the suspension granted a move"
     );
     assert!(inbox.try_recv().is_err());
-    assert!(shard.primary_rebalance.borrow().pending.is_none());
+    assert!(shard.primary_rebalance.borrow().pending.is_empty());
 }
 
 #[derive(Default)]
@@ -779,7 +989,7 @@ fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_
             };
             shard.fence_rebalance_authority(&message);
             assert_eq!(
-                shard.primary_rebalance.borrow().pending.is_none(),
+                shard.primary_rebalance.borrow().pending.is_empty(),
                 should_revoke,
                 "group={group}, view={view}, command={command:?}"
             );
