@@ -9684,6 +9684,9 @@ where
         let mut repair_ring_entries = 0usize;
         let mut repair_ring_bytes = 0u64;
         let mut untrusted_logs = 0usize;
+        // Against `PARTITION_VIEW_CHANGES_INFLIGHT_MAX`. View changes that
+        // start in a frame handler show up in the count of the next sweep.
+        let mut view_changes_inflight = 0usize;
         let mut owing_retirement = 0usize;
         // The replication gauges are scraped, not driven: once per report
         // interval is enough.
@@ -9699,6 +9702,7 @@ where
                 partition.drive_persistence().await;
                 let consensus = partition.consensus();
                 untrusted_logs += usize::from(consensus.has_untrusted_log());
+                view_changes_inflight += usize::from(consensus.status() == Status::ViewChange);
                 owing_retirement +=
                     usize::from(replication_due && partition.owes_session_retirement());
                 let (entries, bytes) = partition.repair_ring_occupancy();
@@ -9746,6 +9750,10 @@ where
         // Repair sessions this sweep has opened, against
         // `PARTITION_REPAIR_ARMS_PER_TICK_MAX`.
         let mut repair_arms = 0usize;
+        // Heartbeat votes this sweep has cast, against
+        // `PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX`.
+        let mut view_change_votes = 0usize;
+        let mut view_change_votes_held = 0usize;
         // Commit walks this sweep has run, against
         // `PARTITION_WALKS_PER_TICK_MAX`.
         let mut walks = 0usize;
@@ -9834,11 +9842,19 @@ where
             let grid_tick = consensus
                 .heartbeat_schedule()
                 .is_grid_tick(self.shard_ticks.get());
+            let vote_held = view_change_votes >= PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX
+                || view_changes_inflight >= PARTITION_VIEW_CHANGES_INFLIGHT_MAX;
+            let voted_before = consensus.votes_to_leave_view();
+            let history_fenced = partition.history_writes_pending();
             let actions = consensus.tick_with_grid(
                 PlaneKind::Partitions,
-                partition.history_writes_pending(),
+                history_fenced,
                 grid_tick,
+                vote_held,
             );
+            view_change_votes += usize::from(!voted_before && consensus.votes_to_leave_view());
+            view_change_votes_held +=
+                usize::from(vote_held && !history_fenced && consensus.heartbeat_timed_out());
             partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
@@ -10431,6 +10447,8 @@ where
             }
         }
         self.partition_repairs_inflight.set(repairs_live);
+        self.metrics
+            .set_partition_view_changes(view_changes_inflight, view_change_votes_held);
         self.partition_recovery.set_active(recovering);
         for kind in ConsumerKind::ALL {
             self.metrics
@@ -13094,7 +13112,7 @@ where
         let grid_tick = consensus
             .heartbeat_schedule()
             .is_grid_tick(self.shard_ticks.get());
-        let actions = consensus.tick_with_grid(PlaneKind::Metadata, false, grid_tick);
+        let actions = consensus.tick_with_grid(PlaneKind::Metadata, false, grid_tick, false);
         if !consensus.is_primary() || !primary_rebalance::consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
         }
@@ -13752,6 +13770,29 @@ const PARTITION_REPAIR_ARMS_PER_TICK_MAX: usize = 3;
 /// per-sweep budget can see. Over-cap groups stay gap-stopped with their
 /// debounce satisfied, so they arm as sessions complete.
 const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
+
+/// Heartbeat votes the partition tick sweep lets its backups CAST per pass.
+///
+/// A node that dies takes the primary of every group it led, and the heartbeat
+/// timers of those groups fire on a few ticks. Each vote that a peer joins
+/// becomes a view change: two superblock writes per replica through the
+/// partition I/O lane, on a status timer that votes for the next view after
+/// `view_change_status_timeout`. More view changes than the lane finishes in
+/// that time turn into a second round of them.
+///
+/// Only the vote of the heartbeat timeout is held, and its timer stays fired,
+/// so the sweep asks again on every tick. A backup with a held vote still joins
+/// the vote of a peer, so a group waits for the first of its backups to get a
+/// turn, not for all of them.
+const PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX: usize = 4;
+
+/// Groups in view change this shard holds before it casts no more heartbeat
+/// votes.
+///
+/// The concurrency half of the pair: the rate cap above cannot see how fast
+/// the I/O lane finishes view changes. View changes that a peer or a primary
+/// transfer started count too, and nothing here delays them.
+const PARTITION_VIEW_CHANGES_INFLIGHT_MAX: usize = 128;
 
 /// Commit walks the partition tick sweep will RUN per pass.
 ///

@@ -79,6 +79,12 @@ const PARTITION_TICKS: u64 = 10 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS;
 const ELECTION_TICKS_MAX: u64 = TimeoutManager::NORMAL_HEARTBEAT_TICKS
     + TimeoutManager::COMMIT_MESSAGE_TICKS
     + TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS;
+/// Groups that replica 0 leads from their start. No write tells them apart,
+/// so their heartbeats leave on the same ticks.
+const MANY_GROUPS: usize = 24;
+/// Before `STABLE_INTERVAL` of the rebalancer (500 ticks), so it moved no
+/// primary yet.
+const QUIET_TICKS: u64 = 300;
 /// Past `NORMAL_HEARTBEAT_TICKS` (500): the cut lasts long enough that the
 /// group replica 2 led fails over and replica 2 starts a view change itself.
 const CUT_TICKS: u64 = 600;
@@ -350,6 +356,59 @@ fn given_a_crashed_primary_should_elect_a_new_one_within_the_election_bound() {
     );
 }
 
+/// More groups lose their primary on one tick than a shard casts heartbeat
+/// votes for per tick. The survivors hold some votes back, and each group
+/// still changes its view once, within the election bound.
+#[test]
+fn given_a_crashed_primary_of_many_groups_should_hold_votes_and_change_each_view_once() {
+    let (mut sim, _client) = cluster(SEED);
+    let namespaces: Vec<_> = (0..MANY_GROUPS)
+        .map(|partition| IggyNamespace::new(1, 1, partition))
+        .collect();
+    for &namespace in &namespaces {
+        sim.init_partition(namespace);
+    }
+    for _ in 0..QUIET_TICKS {
+        sim.step();
+    }
+    let view = healthy_view(&sim, namespaces[0]);
+    assert!(
+        namespaces.iter().all(|&namespace| {
+            sim.primary_index(namespace) == Some(LEADER) && healthy_view(&sim, namespace) == view
+        }),
+        "replica 0 must lead every group in one view before the fault"
+    );
+    sim.replica_crash(LEADER);
+
+    let mut held_max = 0;
+    let mut elected = vec![None; MANY_GROUPS];
+    for _ in 0..ELECTION_TICKS_MAX + MANY_GROUPS as u64 {
+        sim.step();
+        held_max = held_max.max(votes_held(&sim, LEADER));
+        for (elected, &namespace) in elected.iter_mut().zip(&namespaces) {
+            if elected.is_none() {
+                *elected = (0..sim.replica_count)
+                    .filter(|&replica| replica != LEADER)
+                    .filter_map(|replica| {
+                        sim.partition_consensus_state(usize::from(replica), namespace)
+                    })
+                    .find(|state| state.is_primary && state.status == Status::Normal)
+                    .map(|state| state.view);
+            }
+        }
+    }
+
+    assert!(
+        held_max > 0,
+        "the heartbeat timers of {MANY_GROUPS} groups fired on one tick, and no shard held a vote"
+    );
+    assert_eq!(
+        elected,
+        vec![Some(view + 1); MANY_GROUPS],
+        "the view in which a survivor first led each group"
+    );
+}
+
 #[test]
 fn given_a_primary_cut_off_should_be_replaced_and_rejoin_as_a_backup() {
     let mut run = Run::single();
@@ -532,6 +591,18 @@ fn healthy_view(sim: &Simulator, namespace: IggyNamespace) -> u32 {
         .map(|state| state.view)
         .max()
         .unwrap_or(0)
+}
+
+/// `partition_view_change_votes_held` summed over every shard of every node
+/// but `down`.
+fn votes_held(sim: &Simulator, down: u8) -> i64 {
+    sim.replicas
+        .iter()
+        .enumerate()
+        .filter(|(replica, _)| *replica != usize::from(down))
+        .flat_map(|(_, replica)| replica.shards.iter())
+        .map(|shard| shard.metrics().partition_view_changes_value().1)
+        .sum()
 }
 
 /// The highest metadata view replicas 0 and 1 hold.
