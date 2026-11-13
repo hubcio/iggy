@@ -1801,7 +1801,6 @@ where
     /// `(namespace, requester replica id)`. Bounded by the replica count times
     /// the groups this shard serves; replaced per fresh nonce.
     state_transfer_offers: RefCell<HashMap<(u64, u8), ServedStateTransfer>>,
-    partition_recovery: metadata::PartitionRecovery,
     /// Partition groups with an offer build under way but no offer yet, keyed
     /// by namespace and carrying ticks since the last request that advanced it.
     ///
@@ -2216,7 +2215,6 @@ where
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         // Metadata admits a stream's wrap set with the keys its partitions open.
         let metadata = metadata.with_stream_key_context(partitions.key_context());
-        let partition_recovery = metadata.applied_frontier().track_partition_recovery();
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let poll_completions =
@@ -2263,7 +2261,6 @@ where
             metadata_gap_ticks: Cell::new(0),
             metadata_walk_stuck_op: Cell::new(0),
             state_transfer_offers: RefCell::new(HashMap::new()),
-            partition_recovery,
             partition_offer_builds: RefCell::new(HashMap::new()),
             partition_transfer_waiters: RefCell::new(Vec::new()),
             parked_partition_transfer_requests: RefCell::new(BTreeMap::new()),
@@ -3176,7 +3173,6 @@ where
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         // Metadata admits a stream's wrap set with the keys its partitions open.
         let metadata = metadata.with_stream_key_context(partitions.key_context());
-        let partition_recovery = metadata.applied_frontier().track_partition_recovery();
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let host: Rc<dyn ShardHost> = Rc::new(NoopHost);
@@ -3228,7 +3224,6 @@ where
             metadata_gap_ticks: Cell::new(0),
             metadata_walk_stuck_op: Cell::new(0),
             state_transfer_offers: RefCell::new(HashMap::new()),
-            partition_recovery,
             partition_offer_builds: RefCell::new(HashMap::new()),
             partition_transfer_waiters: RefCell::new(Vec::new()),
             parked_partition_transfer_requests: RefCell::new(BTreeMap::new()),
@@ -10429,18 +10424,12 @@ where
         // Count after every rotation, transfer abandonment and scheduled arm,
         // including paths that skip the rest of their partition's sweep.
         let mut repairs_live = 0usize;
-        let mut recovering = false;
         // A stranded key stays until its own store or delete succeeds, so a
         // gauge that never falls is the operator's only signal.
         let mut stranded = [0usize; ConsumerKind::COUNT];
         for namespace in partitions.namespaces() {
             if let Some(partition) = partitions.get_by_ns(namespace) {
                 repairs_live += usize::from(partition.repair().is_some());
-                recovering |= partition.repair().is_some()
-                    || partition.transfer().is_some()
-                    || partition.transfer_rearm.is_some()
-                    || partition.consensus().is_transferring()
-                    || partition.consensus().has_untrusted_log();
                 for kind in ConsumerKind::ALL {
                     stranded[kind.index()] += partition.stranded_consumer_offset_count(kind);
                 }
@@ -10449,7 +10438,6 @@ where
         self.partition_repairs_inflight.set(repairs_live);
         self.metrics
             .set_partition_view_changes(view_changes_inflight, view_change_votes_held);
-        self.partition_recovery.set_active(recovering);
         for kind in ConsumerKind::ALL {
             self.metrics
                 .set_consumer_offsets_stranded(kind, stranded[kind.index()]);

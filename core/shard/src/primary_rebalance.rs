@@ -579,13 +579,10 @@ where
             let admission_opened = state.admission_opened;
             for replica in 0..consensus.replica_count() {
                 let index = usize::from(replica);
-                let ready = if replica == consensus.replica() {
-                    !metadata.applied_frontier().has_partition_recovery()
-                } else {
-                    state.peers[index]
+                let ready = replica == consensus.replica()
+                    || state.peers[index]
                         .ready_at
-                        .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT)
-                };
+                        .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT);
                 if state.eligible[index] != ready {
                     state.eligible[index] = ready;
                     changed = true;
@@ -623,9 +620,9 @@ where
                 .iter()
                 .enumerate()
                 .all(|(index, peer)| index == usize::from(consensus.replica()) || peer.heard);
-            // Placement readiness drops a node while any of its partitions
-            // repairs, which says nothing about whether it holds the others.
-            // Liveness is whether it answers at all.
+            // Placement readiness drops a node whose metadata consensus has not
+            // settled, which says nothing about whether it holds its
+            // partitions. Liveness is whether it answers at all.
             let live: Vec<bool> = (0..consensus.replica_count())
                 .map(|replica| {
                     replica == consensus.replica()
@@ -949,12 +946,7 @@ where
                 };
                 reply.ready = u8::from(
                     header.kind == PrimaryRebalanceKind::MetadataProbe
-                        && consensus_ready(consensus)
-                        && !self
-                            .plane
-                            .metadata()
-                            .applied_frontier()
-                            .has_partition_recovery(),
+                        && consensus_ready(consensus),
                 );
                 if header.kind == PrimaryRebalanceKind::MetadataProbe {
                     let (statuses, unsent) = self.next_reported_statuses();
@@ -1104,11 +1096,6 @@ where
                                 && partition.consensus().is_primary()
                         } else {
                             partition_ready(partition, &header)
-                                && !self
-                                    .plane
-                                    .metadata()
-                                    .applied_frontier()
-                                    .has_partition_recovery()
                         }
                 }));
                 if let Some(partition) = partition {
@@ -1395,6 +1382,9 @@ fn partition_history_ready<B: MessageBus, SB: SuperblockStore>(
         && consensus_ready(partition.consensus())
         && partition.fatal().is_none()
         && !partition.requires_state_transfer()
+        && partition.transfer().is_none()
+        && partition.transfer_rearm.is_none()
+        && !partition.consensus().has_untrusted_log()
         && !partition.read_history_is_changing()
 }
 

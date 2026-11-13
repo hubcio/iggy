@@ -950,6 +950,8 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
         "recovering",
         "unproved",
         "transfer",
+        "transfer session",
+        "transfer re-arm",
         "repair",
         "ceded",
         "recovery barrier",
@@ -971,6 +973,30 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
             "transfer" => partition
                 .consensus()
                 .set_state_transfer_stage(StateTransferStage::AwaitingTarget),
+            "transfer session" => {
+                let (shard, _inbox) = owner();
+                partition.set_transfer(Some(
+                    partitions::state_transfer::PartitionTransferSession {
+                        nonce: NONCE,
+                        peer: SOURCE,
+                        commit_op: 0,
+                        artifacts: Vec::new(),
+                        target_accepted: false,
+                        idle_ticks: 0,
+                        spill: None,
+                        scan: None,
+                        seed: None,
+                        pulled_len: 0,
+                        slot: shard.plane.partitions().transfer_slot(),
+                    },
+                ));
+            }
+            "transfer re-arm" => {
+                partition.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
+                    peer: SOURCE,
+                    after_ticks: 1,
+                });
+            }
             "repair" => {
                 partition.set_repair(Some(partitions::RepairSession {
                     nonce: NONCE,
@@ -1015,43 +1041,21 @@ fn given_busy_source_history_when_capturing_frontier_should_allow_drain_but_not_
     assert!(!partition_ready(&partition, &probe));
 }
 
+/// A node is ready for primaries by its metadata consensus alone. What its
+/// partitions repair is the business of each partition probe.
 #[compio::test]
-async fn given_another_shard_recovering_when_metadata_is_probed_should_refuse_primary_moves_without_blocking_admission()
- {
+async fn given_a_metadata_probe_should_answer_ready_only_while_the_metadata_consensus_is_settled() {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
     let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
-    let frontier = shard.plane.metadata().applied_frontier();
-    let other_shard = frontier.track_partition_recovery();
-    other_shard.set_active(true);
     let mut probe = probe_header(consensus, NONCE);
     probe.replica = 0;
     probe.quorum_age_ns = 0;
     shard.on_primary_rebalance(probe, Vec::new()).await;
+    assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 1);
+    consensus.observe_newer_view(consensus.view() + 1);
     probe.nonce += 1;
     shard.on_primary_rebalance(probe, Vec::new()).await;
     assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 0);
-    assert!(frontier.partition_requests_allowed(shard.bus.monotonic_now()));
-    drop(other_shard);
-    probe.nonce += 1;
-    shard.on_primary_rebalance(probe, Vec::new()).await;
-    assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 1);
-}
-
-#[compio::test]
-async fn given_local_partition_recovery_when_the_coordinator_probes_should_exclude_itself_until_recovery_finishes()
- {
-    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, 3, 0);
-    let recovery = shard
-        .plane
-        .metadata()
-        .applied_frontier()
-        .track_partition_recovery();
-    recovery.set_active(true);
-    shard.tick_primary_rebalance().await;
-    assert!(!shard.primary_rebalance.borrow().eligible[0]);
-    recovery.set_active(false);
-    shard.tick_primary_rebalance().await;
-    assert!(shard.primary_rebalance.borrow().eligible[0]);
 }
 
 #[compio::test]
