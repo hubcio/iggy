@@ -155,6 +155,9 @@ pub struct PartitionMaterialisation {
     consumer_offsets_max: usize,
     /// `None` when every node stores the partition.
     members: Option<ReplicaSet>,
+    /// The metadata op that created the incarnation, see
+    /// `IggyPartition::start_at_create_op`.
+    created_op: u64,
 }
 
 #[cfg(feature = "simulator")]
@@ -167,6 +170,7 @@ impl PartitionMaterialisation {
             first_initialization,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
             members: None,
+            created_op: 0,
         }
     }
 
@@ -179,6 +183,12 @@ impl PartitionMaterialisation {
     #[must_use]
     pub const fn with_members(mut self, members: Option<ReplicaSet>) -> Self {
         self.members = members;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_created_op(mut self, created_op: u64) -> Self {
+        self.created_op = created_op;
         self
     }
 }
@@ -436,8 +446,12 @@ pub struct GatheredClients<T = ConnectedClientInfo> {
 pub enum PartitionRead {
     Primary,
     DeferredPoll(Box<DeferredPollRequest>),
-    SessionRetired {
-        identity: iggy_binary_protocol::requests::system::SessionIdentity,
+    /// Whether the replica holds a whole retirement batch retired; see
+    /// [`partitions::IggyPartition::sessions_retired`]. Shared because every
+    /// partition a walk visits reads the same batch.
+    SessionsRetired {
+        ended: Arc<[iggy_binary_protocol::requests::system::SessionIdentity]>,
+        retired_through: u64,
         created_revision: u64,
     },
     /// Arm the incarnation's session gate for `debt_op` and report whether it
@@ -527,7 +541,7 @@ impl PartitionRead {
             | Self::UnboundPollOnPrimary { .. }
             | Self::Poll { .. } => true,
             Self::Primary
-            | Self::SessionRetired { .. }
+            | Self::SessionsRetired { .. }
             | Self::RetirementDebt { .. }
             | Self::GroupOffsetState { .. }
             | Self::ResolveSegmentDeleteOffset { .. } => false,
@@ -554,7 +568,7 @@ pub enum PartitionReadReply {
         view: u32,
         primary: u8,
     },
-    SessionRetired(bool),
+    SessionsRetired(partitions::BatchRetirement),
     RetirementDebt(partitions::RetirementDebtStatus),
     /// Permanent failure of this incarnation. It is not a retirement proof
     /// until the caller durably fences the incarnation against future serving.
@@ -2755,7 +2769,7 @@ where
         read: PartitionRead,
     ) -> Result<(u16, Receiver<PartitionReadReply>), IggyError> {
         let target = self.shards_table.shard_for(namespace).or_else(|| {
-            matches!(read, PartitionRead::SessionRetired { .. }).then(|| {
+            matches!(read, PartitionRead::SessionsRetired { .. }).then(|| {
                 crate::shards_table::calculate_shard_assignment(&namespace, self.shard_count)
             })
         });
@@ -5440,6 +5454,7 @@ where
             first_initialization,
             consumer_offsets_max,
             members,
+            created_op,
         } = materialisation;
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
@@ -5527,6 +5542,8 @@ where
         if members.len() == 1 && !partition.durability().is_persisted() {
             partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
         }
+        // After the retained log, whose frontier the adoption assigns.
+        partition.start_at_create_op(created_op);
         partitions.insert(namespace, partition);
         if self.redispatch_parked_frames(namespace, epoch) {
             // This mutation occurs outside the pump, unlike production's
