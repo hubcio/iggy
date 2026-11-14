@@ -48,7 +48,7 @@ use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::{
     Credentials as RustCredentials, IggyError, MetadataChangeCursor, MetadataChangeRecord,
     MetadataChanges, MetadataChangesQuery, MetadataCurrentItem, MetadataCurrentPageToken,
-    PendingOperationsConfig, stream_key_fingerprint,
+    PendingOperationsConfig, StreamsPageQuery, stream_key_fingerprint,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -340,6 +340,31 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not get streams: {error}"))?;
             Ok(streams.into_iter().map(ffi::Stream::from).collect())
+        })
+    }
+
+    /// Reads one page of the streams in ascending id.
+    ///
+    /// The Rust SDK validates the query before anything is sent, so a refused
+    /// query and a refusal by the server both carry their error code.
+    pub fn get_streams_page(
+        &self,
+        query: ffi::StreamsPageQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::StreamsPage, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let query = StreamsPageQuery::try_from(query)
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| format!("Could not get streams page: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let page = self
+                .inner
+                .get_streams_page(&query)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| format!("Could not get streams page: {error}"))?;
+            Ok(ffi::StreamsPage::from(page))
         })
     }
 
@@ -1750,6 +1775,17 @@ pub fn encryption_key_fingerprint_base64(
         .map(|key| key.fingerprint())
         .inspect_err(|error| error_info.record(error))
         .map_err(|error| format!("Could not compute the stream key fingerprint: {error}"))
+}
+
+pub fn validate_streams_page_query(
+    query: ffi::StreamsPageQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<(), String> {
+    *error_info = ffi::ErrorInfo::default();
+    StreamsPageQuery::try_from(query)
+        .and_then(|query| query.validate())
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Invalid streams page query: {error}"))
 }
 
 /// Parses the `mc1_` text form. The error never echoes the text.

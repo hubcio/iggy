@@ -94,6 +94,7 @@ class ProtocolParityTest {
             Map.entry(CommandCode.Stream.GET_ALL, "GET_STREAMS_CODE"),
             Map.entry(CommandCode.Stream.CREATE, "CREATE_STREAM_CODE"),
             Map.entry(CommandCode.Stream.DELETE, "DELETE_STREAM_CODE"),
+            Map.entry(CommandCode.Stream.GET_PAGE, "GET_STREAMS_PAGE_CODE"),
             Map.entry(CommandCode.Topic.GET, "GET_TOPIC_CODE"),
             Map.entry(CommandCode.Topic.GET_ALL, "GET_TOPICS_CODE"),
             Map.entry(CommandCode.Topic.CREATE, "CREATE_TOPIC_CODE"),

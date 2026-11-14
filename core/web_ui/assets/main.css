@@ -301,6 +301,10 @@ tbody tr:hover {
   margin-right: auto;
 }
 
+.pager input {
+  margin-top: 0;
+}
+
 details summary {
   cursor: pointer;
 }

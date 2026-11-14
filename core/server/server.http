@@ -220,6 +220,10 @@ GET {{url}}/streams
 Authorization: Bearer {{access_token}}
 
 ###
+GET {{url}}/stream-pages?limit=100&name=orders
+Authorization: Bearer {{access_token}}
+
+###
 GET {{url}}/streams/{{stream_id}}
 Authorization: Bearer {{access_token}}
 

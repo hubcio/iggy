@@ -19,19 +19,22 @@ use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, streams_from_wire};
 use crate::{
     BinaryClient, Identifier, IggyError, Stream, StreamClient, StreamCreateOptions, StreamDetails,
-    StreamUpdateOptions,
+    StreamUpdateOptions, StreamsPage, StreamsPageQuery,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_STREAM_CODE, DELETE_STREAM_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_STREAMS_PAGE_CODE,
 };
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsPageRequest,
+    GetStreamsRequest,
 };
 use iggy_binary_protocol::requests::system::ResourceTarget;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_streams_page::GetStreamsPageResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> StreamClient for B {
@@ -61,6 +64,19 @@ impl<B: BinaryClient> StreamClient for B {
         }
         let wire_resp = super::decode_response::<GetStreamsResponse>(&response)?;
         Ok(streams_from_wire(wire_resp)?)
+    }
+
+    async fn get_streams_page(&self, query: &StreamsPageQuery) -> Result<StreamsPage, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        query.validate()?;
+        let response = self
+            .send_raw_with_response(
+                GET_STREAMS_PAGE_CODE,
+                GetStreamsPageRequest::try_from(query)?.to_bytes(),
+            )
+            .await?;
+        let wire_resp = super::decode_response::<GetStreamsPageResponse>(&response)?;
+        StreamsPage::try_from(wire_resp)
     }
 
     async fn create_stream(

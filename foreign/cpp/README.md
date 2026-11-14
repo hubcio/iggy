@@ -107,11 +107,11 @@ errors from these methods:
 - `CreateConsumerGroup`, `DeleteConsumerGroup`, `JoinConsumerGroup`, and `LeaveConsumerGroup`.
 - `StoreConsumerOffset`, `StoreConsumerPosition`, `DeleteConsumerOffset`, and `DeleteConsumerPosition`.
 - `PollMessages`, `PendingPoll::Wait`, `Reader`, and the calls of `PartitionReader`.
-- `GetMetadataChanges`.
+- `GetStreamsPage` and `GetMetadataChanges`.
 
-Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
+Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetStreamsPage` and `GetMetadataChanges` are the exceptions: they report every invalid query as `invalid_command`, including one the bridge refuses.
 
-Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`.
+Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. The stream page functions also take it. It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the stream page and metadata change functions, which record invalid input as `invalid_command`.
 
 `send_binary_request_to_replica(code, payload, replica_id, error_info)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 

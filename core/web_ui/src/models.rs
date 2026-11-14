@@ -70,6 +70,14 @@ pub struct Stream {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct StreamsPage {
+    pub streams: Vec<Stream>,
+    /// The `after_id` of the next page, `None` after the last one. A page can
+    /// hold fewer streams than its limit, or none, while this is set.
+    pub next_after_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct StreamDetails {
     pub id: u32,
     pub created_at: u64,
@@ -194,27 +202,33 @@ mod tests {
     }
 
     #[test]
-    fn given_server_streams_should_decode_stream_list() {
-        let server = vec![iggy_common::Stream {
-            id: 1,
-            created_at: IggyTimestamp::from(CREATED_AT),
-            name: "orders".to_owned(),
-            size: IggyByteSize::from(2_048),
-            messages_count: 10,
-            topics_count: 2,
-            options: Default::default(),
-        }];
-        let mirror: Vec<Stream> = decode(&server);
-        assert_eq!(
-            mirror,
-            [Stream {
+    fn given_server_streams_page_should_decode_streams_and_cursor() {
+        let server = iggy_common::StreamsPage {
+            streams: vec![iggy_common::Stream {
                 id: 1,
-                created_at: CREATED_AT,
+                created_at: IggyTimestamp::from(CREATED_AT),
                 name: "orders".to_owned(),
-                size: "2 KiB".to_owned(),
+                size: IggyByteSize::from(2_048),
                 messages_count: 10,
                 topics_count: 2,
-            }]
+                options: Default::default(),
+            }],
+            next_after_id: Some(1),
+        };
+        let mirror: StreamsPage = decode(&server);
+        assert_eq!(
+            mirror,
+            StreamsPage {
+                streams: vec![Stream {
+                    id: 1,
+                    created_at: CREATED_AT,
+                    name: "orders".to_owned(),
+                    size: "2 KiB".to_owned(),
+                    messages_count: 10,
+                    topics_count: 2,
+                }],
+                next_after_id: Some(1),
+            }
         );
     }
 

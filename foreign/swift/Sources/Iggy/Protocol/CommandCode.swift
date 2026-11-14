@@ -63,6 +63,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case createStream = 202
     case deleteStream = 203
     // 204 was update_stream and 205 purge_stream. The server keeps both retired.
+    case getStreamsPage = 206
     case getTopic = 300
     case getTopics = 301
     case createTopic = 302
@@ -120,6 +121,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .getStreams: "stream.list"
         case .createStream: "stream.create"
         case .deleteStream: "stream.delete"
+        case .getStreamsPage: "stream.page"
         case .getTopic: "topic.get"
         case .getTopics: "topic.list"
         case .createTopic: "topic.create"

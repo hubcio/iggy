@@ -60,6 +60,7 @@ export const COMMAND_CODE = {
   CreateStream: 202,
   DeleteStream: 203,
   // 204 is retired and must never be reused.
+  GetStreamsPage: 206,
   GetTopic: 300,
   GetTopics: 301,
   CreateTopic: 302,

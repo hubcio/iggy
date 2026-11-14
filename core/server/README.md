@@ -271,6 +271,13 @@ is not the partition primary learns of a commit from the next prepare or from
 the periodic commit broadcast. It counts the message only then. While the
 cluster is idle, its counters can lag by up to `cluster.commit_busy_heartbeat_interval`.
 
+`GetStats` and the stream, topic, partition, segment and message gauges of
+`/metrics` read node totals. Each metadata change and each partition write
+keeps these totals up to date, so these reads walk no stream. The per-topic
+series of `/metrics` (`topic_size_bytes`, `topic_messages` and
+`topic_max_size_bytes`) still walk every topic on each scrape. On a node with
+many topics, set `[http.metrics] topic_gauges = false` to drop them.
+
 ### Sessions and retry receipts
 
 Protocol 0.11.1 and later use client-owned registration proofs and `BindSession` (15) to
@@ -531,6 +538,27 @@ Two rings bound the log. `[metadata] change_log_resource_capacity` (default 6553
 
 Each ring also keeps at most 128 MiB of record bodies and evicts its oldest records past that, so large permission sets cannot grow the snapshot past what state transfer carries.
 
+## Stream pages
+
+`GetStreams` (`GET /streams`) returns every stream in one answer. The node
+holds a metadata read while it copies the streams, and metadata changes on
+that node wait for that read to end. `GetStreamsPage` (206) and
+`GET /stream-pages` return one page instead: the streams after `after_id` in
+ascending id, at most `limit` of them. The limit is 1 to 1000, and 100 by
+default. If the request names `name`, the page holds only the streams whose
+name contains that text. The match is case-sensitive.
+
+A page also ends after it scans 65536 streams, so it can hold fewer streams
+than the limit, or none, while `next_after_id` is set. Pass `next_after_id` as
+`after_id` until the answer has none. A new stream takes the lowest free id,
+so a stream created during a walk can land behind the cursor and miss that
+walk.
+
+Reading a page needs the same permission as `GetStreams`. Over HTTP, the
+server refuses an unknown, repeated or malformed query parameter with 400 and
+`InvalidCommand` (3). So a typo cannot restart a walk at the first page.
+`iggy stream list` reads every page, and `--name` filters it.
+
 ## Upgrade recovery
 
 This release changes protocol and storage formats. Servers and compatible
@@ -540,7 +568,7 @@ admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
-This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a breaking change: released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.0 clients before decoding their login, and this server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
+This checkout uses protocol 0.12.3, and 0.12.3 is also its minimum, so it also refuses 0.12.0 to 0.12.2 clients. It is a breaking change. Released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.x clients before decoding their login. This server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 

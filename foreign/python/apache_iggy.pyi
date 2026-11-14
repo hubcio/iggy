@@ -119,6 +119,7 @@ __all__ = [
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "StreamsPage",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
@@ -1576,6 +1577,32 @@ class IggyClient:
         Raises:
             RuntimeError: If the client is not authenticated, the user lacks global
                 `read_streams` or `manage_streams` permission, or the request fails.
+        """
+    def get_streams_page(
+        self,
+        *,
+        after_id: builtins.int | None = None,
+        limit: builtins.int | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[StreamsPage]:
+        r"""
+        Return one page of streams in ascending id order.
+
+        Args:
+            after_id: Start after this stream id. `None` starts at the first
+                stream. Pass the `next_after_id` of the previous page.
+            limit: Streams per page, 1 to 1000. Defaults to 100.
+            name: Keep only the streams whose name contains this text. The
+                match is case-sensitive.
+
+        Returns:
+            An awaitable that resolves to `StreamsPage`.
+
+        Raises:
+            IggyError: With the invalid command code before anything is sent
+                when the query is refused, or when the request fails. A user
+                without global `read_streams` or `manage_streams` permission
+                gets the unauthorized code.
         """
     def update_stream(
         self,
@@ -5086,6 +5113,25 @@ class StreamPermissions:
             topics: Per-topic permissions keyed by topic ID as
                 `dict[int, TopicPermissions] | None`; an empty dict is
                 treated as `None`.
+        """
+
+@typing.final
+class StreamsPage:
+    r"""
+    One page of streams, as `IggyClient.get_streams_page()` returns it.
+
+    The page is converted once: `streams` hands back the same objects on every
+    access.
+    """
+    @property
+    def next_after_id(self) -> builtins.int | None:
+        r"""
+        Pass it as `after_id` to read the next page. `None` on the last page.
+        """
+    @property
+    def streams(self) -> builtins.list[Stream]:
+        r"""
+        The streams of this page in ascending id order.
         """
 
 @typing.final

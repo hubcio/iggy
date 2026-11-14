@@ -32,7 +32,8 @@ use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_STREAMS_CODE, GET_STREAMS_PAGE_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -338,7 +339,9 @@ where
         // transport with an `Unauthenticated` Reply before it reaches the
         // builder, so this arm only ever fires if that gate is bypassed.
         GET_CLUSTER_METADATA_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
-        GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
+        GET_STREAMS_CODE | GET_STREAMS_PAGE_CODE => {
+            authorize_uid(shard, user_id, Permissioner::get_streams)
+        }
         GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,
             user_id,
@@ -589,6 +592,7 @@ mod tests {
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),
             (GET_STREAMS_CODE, unauthenticated, allow),
+            (GET_STREAMS_PAGE_CODE, unauthenticated, allow),
             (GET_TOPIC_CODE, allow, allow),
             (GET_TOPICS_CODE, allow, allow),
             (GET_CONSUMER_GROUP_CODE, allow, allow),

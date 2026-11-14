@@ -61,6 +61,7 @@ internal static class CommandCodes
     internal const int CREATE_STREAM_CODE = 202;
     internal const int DELETE_STREAM_CODE = 203;
     // 204 was UpdateStream and must never be reused.
+    internal const int GET_STREAMS_PAGE_CODE = 206;
     internal const int GET_TOPIC_CODE = 300;
     internal const int GET_TOPICS_CODE = 301;
     internal const int CREATE_TOPIC_CODE = 302;

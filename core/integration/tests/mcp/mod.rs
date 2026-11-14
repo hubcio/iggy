@@ -26,8 +26,8 @@ use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, IggyMessage, MessageClient, Partitioning, Permissions,
     PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
-    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails,
-    UserClient, UserCreateOptions, UserInfo, UserInfoDetails, UserStatus,
+    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, StreamsPage, Topic,
+    TopicDetails, UserClient, UserCreateOptions, UserInfo, UserInfoDetails, UserStatus,
 };
 use integration::{
     harness::{McpClient, McpConfig, TestHarness, seeds},
@@ -183,7 +183,7 @@ async fn should_list_tools(harness: &TestHarness) {
         .expect("Failed to list tools");
 
     assert!(!tools.tools.is_empty());
-    assert_eq!(tools.tools.len(), 41);
+    assert_eq!(tools.tools.len(), 42);
 }
 
 #[iggy_harness(server(mcp))]
@@ -230,6 +230,25 @@ async fn should_return_list_of_streams(harness: &TestHarness) {
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].name, seeds::names::STREAM);
     assert_eq!(streams[0].topics_count, 1);
+}
+
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_page_of_streams(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let page: StreamsPage =
+        invoke(&mcp_client, "get_streams_page", Some(json!({"limit": 1}))).await;
+    assert_eq!(page.streams.len(), 1);
+    assert_eq!(page.streams[0].name, seeds::names::STREAM);
+    assert_eq!(page.next_after_id, None);
+
+    let filtered: StreamsPage = invoke(
+        &mcp_client,
+        "get_streams_page",
+        Some(json!({"name": "no-such-stream"})),
+    )
+    .await;
+    assert!(filtered.streams.is_empty());
+    assert_eq!(filtered.next_after_id, None);
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]

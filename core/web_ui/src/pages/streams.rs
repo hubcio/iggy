@@ -18,24 +18,55 @@
 use dioxus::prelude::*;
 
 use crate::Route;
-use crate::api::ApiError;
+use crate::api::{ApiClient, ApiError, STREAMS_PAGE_SIZE};
 use crate::components::{Crumb, ErrorView, Loading, PageHeader, Stat, api_client, use_session};
 use crate::format;
+use crate::models::StreamsPage;
 
 #[component]
 pub fn Streams() -> Element {
     let session = use_session();
-    let streams = use_resource(move || async move {
-        let mut streams = api_client(session).streams().await?;
-        streams.sort_by_key(|stream| stream.id);
-        Ok::<_, ApiError>(streams)
+    let mut name = use_signal(String::new);
+    // The `next_after_id` of each page before the shown one. The server only
+    // reads forward, so Previous drops the last one and reads again.
+    let mut cursors = use_signal(Vec::<u32>::new);
+    let page = use_resource(move || async move {
+        let after_id = cursors.read().last().copied();
+        read_page(&api_client(session), after_id, &name()).await
     });
 
-    let body = match &*streams.read() {
+    let next_after_id = page
+        .read()
+        .as_ref()
+        .and_then(|shown| shown.as_ref().ok()?.next_after_id);
+    let previous_page = move |_| {
+        cursors.write().pop();
+    };
+    // While a page loads, the page still shown is stale: its cursor would
+    // repeat this step or continue the previous search.
+    let next_page = move |_| {
+        if let Some(after_id) = next_after_id
+            && !page.pending()
+        {
+            cursors.write().push(after_id);
+        }
+    };
+
+    let body = match &*page.read() {
         None => rsx! { Loading {} },
         Some(Err(error)) => rsx! { ErrorView { error: error.clone() } },
-        Some(Ok(streams)) if streams.is_empty() => rsx! { p { class: "muted", "No streams yet." } },
-        Some(Ok(streams)) => rsx! {
+        Some(Ok(shown)) if shown.streams.is_empty() => rsx! {
+            p { class: "muted",
+                if !cursors.read().is_empty() {
+                    "No more streams."
+                } else if name.read().is_empty() {
+                    "No streams yet."
+                } else {
+                    "No streams match."
+                }
+            }
+        },
+        Some(Ok(shown)) => rsx! {
             table {
                 thead {
                     tr {
@@ -48,7 +79,7 @@ pub fn Streams() -> Element {
                     }
                 }
                 tbody {
-                    for stream in streams {
+                    for stream in &shown.streams {
                         tr { key: "{stream.id}",
                             td { "{stream.id}" }
                             td {
@@ -67,6 +98,29 @@ pub fn Streams() -> Element {
 
     rsx! {
         PageHeader { title: "Streams" }
+        div { class: "pager",
+            input {
+                r#type: "search",
+                placeholder: "Search by name",
+                value: name,
+                oninput: move |event| {
+                    name.set(event.value());
+                    cursors.write().clear();
+                },
+            }
+            button {
+                class: "secondary",
+                disabled: cursors.read().is_empty(),
+                onclick: previous_page,
+                "Previous"
+            }
+            button {
+                class: "secondary",
+                disabled: next_after_id.is_none(),
+                onclick: next_page,
+                "Next"
+            }
+        }
         {body}
     }
 }
@@ -132,4 +186,29 @@ pub fn StreamPage(stream_id: u32) -> Element {
     };
 
     rsx! { {body} }
+}
+
+/// Reads on until the page holds `STREAMS_PAGE_SIZE` streams or no stream
+/// follows. One request scans a bounded number of streams, so a rare name can
+/// come back short, or empty, long before the last stream.
+async fn read_page(
+    client: &ApiClient,
+    mut after_id: Option<u32>,
+    name: &str,
+) -> Result<StreamsPage, ApiError> {
+    let mut streams = Vec::new();
+    let mut remaining = STREAMS_PAGE_SIZE;
+    loop {
+        let page = client.streams_page(after_id, remaining, name).await?;
+        remaining =
+            u32::try_from(page.streams.len()).map_or(0, |found| remaining.saturating_sub(found));
+        streams.extend(page.streams);
+        after_id = page.next_after_id;
+        if remaining == 0 || after_id.is_none() {
+            return Ok(StreamsPage {
+                streams,
+                next_after_id: after_id,
+            });
+        }
+    }
 }

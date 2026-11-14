@@ -21,8 +21,12 @@ use serde::de::DeserializeOwned;
 
 use crate::auth::Session;
 use crate::models::{
-    IdentityInfo, LoginUser, PolledMessages, Stream, StreamDetails, TopicDetails, UserInfoDetails,
+    IdentityInfo, LoginUser, PolledMessages, StreamDetails, StreamsPage, TopicDetails,
+    UserInfoDetails,
 };
+
+/// The most streams one page of the streams list holds.
+pub const STREAMS_PAGE_SIZE: u32 = 100;
 
 /// Empty by default so requests go to the server that served the UI. Set at
 /// build time to point `dx serve` at a separately running server, see the
@@ -91,8 +95,17 @@ impl ApiClient {
         self.get(&format!("/users/{user_id}"), &[]).await
     }
 
-    pub async fn streams(&self) -> Result<Vec<Stream>, ApiError> {
-        self.get("/streams", &[]).await
+    /// Streams in ascending id after `after_id`, up to `limit`. An empty `name`
+    /// reads every stream, a non-empty one only the streams whose name contains
+    /// it, case-sensitive.
+    pub async fn streams_page(
+        &self,
+        after_id: Option<u32>,
+        limit: u32,
+        name: &str,
+    ) -> Result<StreamsPage, ApiError> {
+        self.get("/stream-pages", &streams_page_query(after_id, limit, name))
+            .await
     }
 
     pub async fn stream(&self, stream_id: u32) -> Result<StreamDetails, ApiError> {
@@ -154,6 +167,22 @@ fn url(path: &str) -> String {
     format!("{API_BASE_URL}{path}")
 }
 
+/// The server refuses an empty `name`, so an empty search leaves it out.
+fn streams_page_query(
+    after_id: Option<u32>,
+    limit: u32,
+    name: &str,
+) -> Vec<(&'static str, String)> {
+    [
+        after_id.map(|after_id| ("after_id", after_id.to_string())),
+        Some(("limit", limit.to_string())),
+        (!name.is_empty()).then(|| ("name", name.to_owned())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Reads the body as bytes, because `Response::json` goes through one JS
 /// string, which browsers cap well below a page of large messages.
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, ApiError> {
@@ -185,4 +214,43 @@ async fn check_status(response: Response) -> Result<Response, ApiError> {
 #[derive(Deserialize)]
 struct ErrorBody {
     reason: String,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use iggy_common::StreamsPageQuery;
+
+    use super::*;
+
+    #[test]
+    fn given_page_arguments_should_build_the_query_the_server_parses() {
+        // The server refuses a limit out of its range, an unknown key and an
+        // empty name, so a parsed query proves the page size, the key names
+        // and that an empty search sends no name.
+        let cases = [
+            (
+                (None, STREAMS_PAGE_SIZE, ""),
+                StreamsPageQuery {
+                    after_id: None,
+                    limit: STREAMS_PAGE_SIZE,
+                    name: None,
+                },
+            ),
+            (
+                (Some(41), STREAMS_PAGE_SIZE, "orders eu/1"),
+                StreamsPageQuery {
+                    after_id: Some(41),
+                    limit: STREAMS_PAGE_SIZE,
+                    name: Some("orders eu/1".to_owned()),
+                },
+            ),
+        ];
+        for ((after_id, limit, name), expected) in cases {
+            let query = streams_page_query(after_id, limit, name);
+            let parsed = StreamsPageQuery::from_http_query(
+                query.iter().map(|(key, value)| (*key, value.as_str())),
+            );
+            assert_eq!(parsed, Ok(expected), "{query:?}");
+        }
+    }
 }

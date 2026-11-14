@@ -567,6 +567,7 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.UpdateStream(stream, iggy::StreamUpdateOptions().SetName("updated-stream")),
                  iggy::IggyException);
     EXPECT_THROW(client.GetStreams(), iggy::IggyException);
+    EXPECT_THROW(client.GetStreamsPage(iggy::StreamsPageQuery()), iggy::IggyException);
     EXPECT_THROW(client.GetStream(stream), iggy::IggyException);
     EXPECT_THROW(client.DeleteStream(stream), iggy::IggyException);
     EXPECT_THROW(client.CreateTopic(stream, "topic", iggy::TopicCreateOptions().SetPartitionsCount(1)),

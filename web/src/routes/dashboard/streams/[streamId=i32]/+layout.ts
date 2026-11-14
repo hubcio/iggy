@@ -17,9 +17,9 @@
 
 import { clientApi } from '#lib/api/clientApi.js';
 import { streamDetailsMapper } from '#lib/domain/StreamDetails.js';
-import type { PageLoad } from './$types';
+import type { LayoutLoad } from './$types';
 
-export const load: PageLoad = async ({ params }) => {
+export const load: LayoutLoad = async ({ params }) => {
   const data = await clientApi({
     method: 'GET',
     path: `/streams/${+params.streamId}`

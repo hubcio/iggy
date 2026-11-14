@@ -137,8 +137,9 @@ public interface CommandCode {
         GET(200),
         GET_ALL(201),
         CREATE(202),
-        DELETE(203);
+        DELETE(203),
         // 204 is retired and must never be reused.
+        GET_PAGE(206);
 
         private final int value;
 

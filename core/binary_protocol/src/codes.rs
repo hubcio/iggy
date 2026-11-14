@@ -85,6 +85,8 @@ pub const GET_STREAMS_CODE: u32 = 201;
 pub const CREATE_STREAM_CODE: u32 = 202;
 pub const DELETE_STREAM_CODE: u32 = 203;
 // 205 was PURGE_STREAM. Never reuse it.
+/// One page of streams in ascending id, optionally filtered by name.
+pub const GET_STREAMS_PAGE_CODE: u32 = 206;
 
 // -- Topics --
 pub const GET_TOPIC_CODE: u32 = 300;
@@ -165,6 +167,7 @@ mod tests {
         GET_STREAMS_CODE,
         CREATE_STREAM_CODE,
         DELETE_STREAM_CODE,
+        GET_STREAMS_PAGE_CODE,
         GET_TOPIC_CODE,
         GET_TOPICS_CODE,
         CREATE_TOPIC_CODE,

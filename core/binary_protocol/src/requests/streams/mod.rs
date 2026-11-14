@@ -19,6 +19,7 @@ pub mod create_stream;
 pub mod delete_stream;
 pub mod get_stream;
 pub mod get_streams;
+pub mod get_streams_page;
 pub mod rewrap_stream_keys;
 pub mod update_stream_resolved;
 
@@ -26,6 +27,7 @@ pub use create_stream::CreateStreamRequest;
 pub use delete_stream::DeleteStreamRequest;
 pub use get_stream::GetStreamRequest;
 pub use get_streams::GetStreamsRequest;
+pub use get_streams_page::GetStreamsPageRequest;
 pub use rewrap_stream_keys::{
     MAX_WRAP_SET_ENVELOPES, RewrapStreamKeyEntry, RewrapStreamKeysRequest,
     WRAPPED_STREAM_KEY_LENGTH,

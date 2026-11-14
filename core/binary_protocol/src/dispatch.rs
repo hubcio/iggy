@@ -193,6 +193,7 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(POLL_MESSAGES_DEFERRED_CODE, "message.poll_deferred"),
     CommandMeta::non_replicated(CANCEL_DEFERRED_REQUEST_CODE, "message.cancel_deferred"),
     CommandMeta::non_replicated(FETCH_MESSAGES_CODE, "message.fetch"),
+    CommandMeta::non_replicated(GET_STREAMS_PAGE_CODE, "stream.page"),
 ];
 
 /// Lookup command metadata by command code.
@@ -266,6 +267,7 @@ pub const fn command_index(code: u32) -> Option<usize> {
         POLL_MESSAGES_DEFERRED_CODE => 49,
         CANCEL_DEFERRED_REQUEST_CODE => 50,
         FETCH_MESSAGES_CODE => 51,
+        GET_STREAMS_PAGE_CODE => 52,
         _ => return None,
     };
     Some(idx)

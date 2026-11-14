@@ -37,6 +37,21 @@ pub struct GetStream {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct GetStreamsPage {
+    #[schemars(
+        description = "next_after_id of the previous page (optional, omit for the first page)"
+    )]
+    pub after_id: Option<u32>,
+    #[schemars(description = "most streams in the page (optional, 1 to 1000, defaults to 100)")]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "only streams whose name contains this text, case-sensitive (optional)"
+    )]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateStream {
     #[schemars(description = "stream name (required, must be unique)")]
     pub name: String,

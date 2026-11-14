@@ -29,14 +29,16 @@ use crate::{
     OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE, OPTION_FLAG_SECRET,
     OPTION_FLAG_UPDATABLE, OptionKey, OptionSpec, OptionValue, OptionsProvenance, OptionsScope,
     Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
-    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions,
-    TransportEndpoints, UserInfo, UserInfoDetails, UserStatus, descriptors_for,
+    Stats, Stream, StreamDetails, StreamPermissions, StreamsPage, StreamsPageQuery, Topic,
+    TopicDetails, TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
+    descriptors_for,
 };
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
+use iggy_binary_protocol::requests::streams::GetStreamsPageRequest;
 use iggy_binary_protocol::responses::clients::client_response::{
     ClientResponse, ConsumerGroupInfoResponse,
 };
@@ -55,6 +57,7 @@ use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_streams_page::GetStreamsPageResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
@@ -124,6 +127,33 @@ pub fn streams_from_wire(w: GetStreamsResponse) -> Result<Vec<Stream>, IggyError
         .collect::<Result<_, _>>()?;
     streams.sort_by_key(|s| s.id);
     Ok(streams)
+}
+
+impl TryFrom<&StreamsPageQuery> for GetStreamsPageRequest {
+    type Error = IggyError;
+
+    fn try_from(query: &StreamsPageQuery) -> Result<Self, Self::Error> {
+        Ok(Self {
+            after_id: query.after_id,
+            limit: query.limit,
+            name: query.wire_name()?,
+        })
+    }
+}
+
+impl TryFrom<GetStreamsPageResponse> for StreamsPage {
+    type Error = IggyError;
+
+    fn try_from(w: GetStreamsPageResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            streams: w
+                .streams
+                .into_iter()
+                .map(Stream::try_from)
+                .collect::<Result<_, _>>()?,
+            next_after_id: w.next_after_id,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

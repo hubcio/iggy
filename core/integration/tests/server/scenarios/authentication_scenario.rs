@@ -242,6 +242,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             // Streams
             GET_STREAM_CODE => client.get_stream(&ctx.stream_id).await.map(|_| ()),
             GET_STREAMS_CODE => client.get_streams().await.map(|_| ()),
+            GET_STREAMS_PAGE_CODE => client
+                .get_streams_page(&StreamsPageQuery::default())
+                .await
+                .map(|_| ()),
             CREATE_STREAM_CODE => client
                 .create_stream("x", &StreamCreateOptions::default())
                 .await

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use iggy::prelude::*;
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -35,6 +36,8 @@ use super::end_to_end_producing_consumer_group::EndToEndProducingConsumerGroupBe
 use super::pinned_consumer::PinnedConsumerBenchmark;
 use super::pinned_producer::PinnedProducerBenchmark;
 use super::pinned_producer_and_consumer::PinnedProducerAndConsumerBenchmark;
+
+const BENCH_STREAM_PREFIX: &str = "bench-stream-";
 
 impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
     fn from(args: IggyBenchArgs) -> Self {
@@ -98,11 +101,11 @@ pub trait Benchmarkable: Send {
         let partitions_count: u32 = self.args().number_of_partitions();
         let client = self.client_factory().create_authenticated_client().await?;
         let reuse_streams = self.args().reuse_streams();
-        let streams = client.get_streams().await?;
+        let streams = bench_stream_names(&client).await?;
         for i in 1..=number_of_streams {
-            let stream_name = format!("bench-stream-{i}");
+            let stream_name = format!("{BENCH_STREAM_PREFIX}{i}");
             let stream_id: Identifier = stream_name.as_str().try_into()?;
-            if streams.iter().any(|s| s.name == stream_name) {
+            if streams.contains(&stream_name) {
                 if reuse_streams {
                     info!("Appending to existing stream '{}'", stream_name);
                     continue;
@@ -160,10 +163,10 @@ pub trait Benchmarkable: Send {
     async fn check_streams(&self) -> Result<(), IggyError> {
         let number_of_streams = self.args().streams();
         let client = self.client_factory().create_authenticated_client().await?;
-        let streams = client.get_streams().await?;
+        let streams = bench_stream_names(&client).await?;
         for i in 1..=number_of_streams {
-            let stream_name = format!("bench-stream-{i}");
-            if streams.iter().all(|s| s.name != stream_name) {
+            let stream_name = format!("{BENCH_STREAM_PREFIX}{i}");
+            if !streams.contains(&stream_name) {
                 return Err(IggyError::ResourceNotFound(format!(
                     "Streams for testing are not properly initialized. Stream '{stream_name}' is missing."
                 )));
@@ -195,4 +198,21 @@ pub trait Benchmarkable: Send {
 
         format!("{message_size}{messages_per_batch}{data}{rate_limit}")
     }
+}
+
+/// Names of the streams that hold the bench prefix. The name filter keeps the
+/// lookup to the bench streams on a server that holds many other streams.
+async fn bench_stream_names(client: &IggyClient) -> Result<HashSet<String>, IggyError> {
+    let mut names = HashSet::new();
+    let mut query = Some(StreamsPageQuery {
+        limit: MAX_STREAMS_PAGE_LIMIT,
+        name: Some(BENCH_STREAM_PREFIX.to_owned()),
+        ..StreamsPageQuery::default()
+    });
+    while let Some(current) = query {
+        let page = client.get_streams_page(&current).await?;
+        query = current.next(&page);
+        names.extend(page.streams.into_iter().map(|stream| stream.name));
+    }
+    Ok(names)
 }

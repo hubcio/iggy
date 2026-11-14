@@ -23,6 +23,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::StreamCreateOptions;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 
@@ -39,6 +40,48 @@ impl TestStreamListCmd {
     fn to_args(&self) -> Vec<&str> {
         self.output.to_args()
     }
+}
+
+/// `--name` lists the stream whose name holds the filter and leaves out a
+/// stream created next to it.
+struct TestStreamListFilteredCmd {
+    filter: &'static str,
+    matched: &'static str,
+    excluded: &'static str,
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestStreamListFilteredCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        for name in [self.matched, self.excluded] {
+            client
+                .create_stream(name, &StreamCreateOptions::default())
+                .await
+                .expect("create stream");
+        }
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .arg("stream")
+            .arg("list")
+            .arg("--name")
+            .arg(self.filter)
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        command_state
+            .success()
+            .stdout(starts_with(format!(
+                "Executing list streams with names containing \"{}\" in table mode",
+                self.filter
+            )))
+            .stdout(contains(self.matched))
+            .stdout(contains(self.excluded).not());
+    }
+
+    async fn verify_server_state(&self, _client: &dyn Client) {}
 }
 
 #[async_trait]
@@ -99,6 +142,13 @@ pub async fn should_be_successful() {
             OutputFormat::Table,
         ))
         .await;
+    iggy_cmd_test
+        .execute_test(TestStreamListFilteredCmd {
+            filter: "list-orders",
+            matched: "list-orders-eu",
+            excluded: "list-users-eu",
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -116,6 +166,7 @@ Examples:
  iggy stream list
  iggy stream list --list-mode table
  iggy stream list -l table
+ iggy stream list --name orders
 
 {USAGE_PREFIX} stream list [OPTIONS]
 
@@ -125,6 +176,9 @@ Options:
 {CLAP_INDENT}
           [default: table]
           [possible values: table, list]
+
+  -n, --name <NAME>
+          Only the streams whose name contains this text, case-sensitive
 
   -h, --help
           Print help (see a summary with '-h')
@@ -149,6 +203,7 @@ pub async fn should_short_help_match() {
 
 Options:
   -l, --list-mode <LIST_MODE>  List mode (table or list) [default: table] [possible values: table, list]
+  -n, --name <NAME>            Only the streams whose name contains this text, case-sensitive
   -h, --help                   Print help (see more with '--help')
 "#,
             ),

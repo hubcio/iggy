@@ -56,7 +56,7 @@ use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
-use crate::stream::{Stream, StreamDetails};
+use crate::stream::{Stream, StreamDetails, StreamsPage};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
     IdentityInfo as PyIdentityInfo, UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails,
@@ -1005,6 +1005,48 @@ impl IggyClient {
         future_into_py(py, async move {
             let streams = inner.get_streams().await.map_err(to_runtime_error)?;
             Ok(streams.into_iter().map(Stream::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Return one page of streams in ascending id order.
+    ///
+    /// Args:
+    ///     after_id: Start after this stream id. `None` starts at the first
+    ///         stream. Pass the `next_after_id` of the previous page.
+    ///     limit: Streams per page, 1 to 1000. Defaults to 100.
+    ///     name: Keep only the streams whose name contains this text. The
+    ///         match is case-sensitive.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `StreamsPage`.
+    ///
+    /// Raises:
+    ///     IggyError: With the invalid command code before anything is sent
+    ///         when the query is refused, or when the request fails. A user
+    ///         without global `read_streams` or `manage_streams` permission
+    ///         gets the unauthorized code.
+    #[pyo3(signature = (*, after_id=None, limit=None, name=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamsPage]", imports=("collections.abc")))]
+    fn get_streams_page<'a>(
+        &self,
+        py: Python<'a>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] after_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] name: Option<String>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let query = StreamsPageQuery {
+            after_id,
+            limit: limit.unwrap_or(DEFAULT_STREAMS_PAGE_LIMIT),
+            name,
+        };
+        query.validate().map_err(to_runtime_error)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let page = inner
+                .get_streams_page(&query)
+                .await
+                .map_err(to_runtime_error)?;
+            StreamsPage::try_from(page)
         })
     }
 

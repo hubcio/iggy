@@ -17,6 +17,7 @@
 
 use crate::{
     Identifier, IggyError, Stream, StreamCreateOptions, StreamDetails, StreamUpdateOptions,
+    StreamsPage, StreamsPageQuery,
 };
 use async_trait::async_trait;
 
@@ -31,6 +32,11 @@ pub trait StreamClient {
     ///
     /// Authentication is required, and the permission to read the streams.
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError>;
+    /// Get one page of streams in ascending id, optionally only those whose
+    /// name contains a text. [`StreamsPageQuery::next`] gives the next page.
+    ///
+    /// Authentication is required, and the permission to read the streams.
+    async fn get_streams_page(&self, query: &StreamsPageQuery) -> Result<StreamsPage, IggyError>;
     /// Create a new stream.
     ///
     /// `options` may carry the stream's own encryption key. The server stores

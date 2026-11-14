@@ -261,6 +261,12 @@ std::vector<Stream> IggyBlockingClient::GetStreams() {
     });
 }
 
+StreamsPage IggyBlockingClient::GetStreamsPage(const StreamsPageQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return StreamsPage::FromFfi(Handle()->get_streams_page(query.ToFfi(), error_info));
+    });
+}
+
 StreamDetails IggyBlockingClient::GetStream(const Identifier &stream) {
     return RethrowAsIggyException(
         [this, &stream] { return StreamDetails::FromFfi(Handle()->get_stream(stream.ToFfi())); });
@@ -606,6 +612,11 @@ std::string EncryptionKeyFingerprint(const std::string &key_base64) {
             ffi::encryption_key_fingerprint_base64(rust::Str(key_base64.data(), key_base64.size()), error_info);
         return std::string(fingerprint.data(), fingerprint.size());
     });
+}
+
+void StreamsPageQuery::Validate() const {
+    RethrowAsIggyException(
+        [this](ffi::ErrorInfo &error_info) { ffi::validate_streams_page_query(ToFfi(), error_info); });
 }
 
 MetadataChangeCursor MetadataChangeCursor::Parse(const std::string &text) {

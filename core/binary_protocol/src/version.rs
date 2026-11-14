@@ -110,10 +110,11 @@ const PATCH_MASK: u32 = COMPONENT_MAX;
 /// Version 0.12.1 replaces `WaitForMessages` (107) with `FetchMessages` (109).
 /// Version 0.12.2 gives each `GetTopic` partition its `members` and
 /// `in_sync_members` node lists, so a partition record is no longer 64 bytes.
+/// Version 0.12.3 adds `GetStreamsPage` (206).
 /// Finalize this number and the minimum during stable release preparation.
 /// Released servers using protocol 0.11.0 accept every 0.11.x patch, so an
 /// incompatible release needs a new minor version for those servers to reject it.
-pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 2);
+pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
 
 /// Revision of what replicas send each other, which clients never see.
 ///
@@ -136,7 +137,8 @@ pub const REPLICA_WIRE_REVISION: u32 = 2;
 ///
 /// Version 0.12.0 clients can send the retired `WaitForMessages` (107) command,
 /// and 0.12.1 clients read every `GetTopic` partition as a 64-byte record.
-pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 12, 2);
+/// Version 0.12.2 clients were not verified against 0.12.3.
+pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 12, 3);
 const _: () =
     assert!(IGGY_PROTOCOL_VERSION_MIN > 0 && IGGY_PROTOCOL_VERSION_MIN <= IGGY_PROTOCOL_VERSION);
 
@@ -284,8 +286,9 @@ mod tests {
         assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 1)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 0)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 1)));
-        assert!(is_protocol_compatible(pack_protocol_version(0, 12, 2)));
-        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 3)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 2)));
+        assert!(is_protocol_compatible(pack_protocol_version(0, 12, 3)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 4)));
     }
 
     #[test]
@@ -295,8 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn min_requires_the_partition_member_protocol() {
-        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 12, 2));
+    fn min_requires_the_stream_page_protocol() {
+        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 12, 3));
     }
 
     #[test]

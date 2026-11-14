@@ -78,7 +78,7 @@ use resource_options::{
 };
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
-use stream::{Stream, StreamDetails};
+use stream::{Stream, StreamDetails, StreamsPage};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 use user::{IdentityInfo, TokenInfo, UserInfo, UserInfoDetails, UserStatus};
 use user_headers::{HeaderKey, HeaderValue, UserHeaders};
@@ -123,6 +123,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WebSocketFramingConfig>()?;
     m.add_class::<StreamDetails>()?;
     m.add_class::<Stream>()?;
+    m.add_class::<StreamsPage>()?;
     m.add_class::<Stats>()?;
     m.add_class::<CacheMetrics>()?;
     m.add_class::<CacheMetricsKey>()?;

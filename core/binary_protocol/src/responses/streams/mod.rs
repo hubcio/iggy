@@ -19,6 +19,7 @@ mod create_stream;
 mod delete_stream;
 pub mod get_stream;
 pub mod get_streams;
+pub mod get_streams_page;
 mod stream_response;
 
 pub use super::EmptyResponse;
@@ -26,4 +27,5 @@ pub use create_stream::CreateStreamResponse;
 pub use delete_stream::DeleteStreamResponse;
 pub use get_stream::{GetStreamResponse, TopicHeader};
 pub use get_streams::GetStreamsResponse;
+pub use get_streams_page::GetStreamsPageResponse;
 pub use stream_response::StreamResponse;

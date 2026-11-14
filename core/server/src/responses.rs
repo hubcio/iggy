@@ -35,13 +35,16 @@ use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_STREAMS_CODE, GET_STREAMS_PAGE_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
-use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
+use iggy_binary_protocol::requests::streams::{
+    GetStreamRequest, GetStreamsPageRequest, GetStreamsRequest,
+};
 use iggy_binary_protocol::requests::system::{
     DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
 };
@@ -59,6 +62,7 @@ use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
 };
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_streams_page::GetStreamsPageResponse;
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
@@ -74,13 +78,13 @@ use iggy_binary_protocol::{
 };
 use iggy_common::wire_conversions::{describe_options_response, resource_options_to_wire_split};
 use iggy_common::{
-    HeaderValue, IggyError, IggyTimestamp, OptionKey, OptionsScope, ResourceOptions, UserStatus,
-    public_options,
+    HeaderValue, IggyError, IggyTimestamp, MAX_STREAMS_PAGE_LIMIT, OptionKey, OptionsScope,
+    ResourceOptions, UserStatus, public_options,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::{Stream, StreamsInner, Topic};
+use metadata::stm::stream::{ResourceCounts, Stream, StreamsInner, Topic};
 use metadata::stm::user::User;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -361,6 +365,13 @@ where
                 build_get_streams_response(shard)?.to_bytes(),
             ))
         }
+        GET_STREAMS_PAGE_CODE => {
+            let request =
+                GetStreamsPageRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            Ok(NonReplicatedResponse::Bytes(
+                build_get_streams_page_response(shard, &request)?.to_bytes(),
+            ))
+        }
         GET_TOPIC_CODE => {
             let request =
                 GetTopicRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
@@ -513,49 +524,37 @@ where
     }
 }
 
-/// `(streams, topics, partitions, segments, message bytes, messages)` for the
-/// whole node, from committed metadata plus the shared stats registry.
-///
-/// Segments are summed PER PARTITION through the same floor the detail
-/// responses apply (see [`partition_response`]), not from the stream's rolled-up
-/// counter: that counter only advances once a partition materialises, which
-/// trails its commit by a reconciler pass. Summing it made `[stats]` report
-/// fewer segments than `get_topic` did for the same partitions, and let the
-/// total climb between two reads with no write in between.
-fn aggregate_stats_totals(
-    streams: &metadata::stm::stream::StreamsInner,
-) -> Result<(u32, u32, u32, u32, u64, u64), IggyError> {
-    let mut topics_count = 0u32;
-    let mut partitions_count = 0u32;
-    let mut segments_count = 0u32;
-    let mut messages_size_bytes = 0u64;
-    let mut messages_count = 0u64;
-    for (_, stream) in &streams.items {
-        topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
-        messages_size_bytes =
-            messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
-        messages_count = messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-        for (_, topic) in &stream.topics {
-            partitions_count =
-                partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
-            for partition in &topic.partitions {
-                segments_count = segments_count.saturating_add(partition_segments_count(
-                    streams,
-                    stream.id,
-                    topic.id,
-                    partition.id,
-                ));
-            }
-        }
+/// The node totals a stats read reports, taken from the committed counts and
+/// the node stats, so the read walks no stream.
+struct StatsTotals {
+    counts: ResourceCounts,
+    segments_count: u64,
+    messages_size_bytes: u64,
+    messages_count: u64,
+}
+
+/// Segments count every committed partition through the floor the detail
+/// responses apply (see [`partition_response`]), not only the partitions that
+/// materialised: a partition materialises a reconciler pass after its commit,
+/// so the total would otherwise report fewer segments than `get_topic` does
+/// and climb between two reads with no write in between. With a floor of one,
+/// the sum of `max(segments, floor)` is the node sum plus the floor for each
+/// partition without a segment of its own.
+fn stats_totals(streams: &StreamsInner) -> StatsTotals {
+    const _: () = assert!(MATERIALIZED_SEGMENTS_FLOOR == 1);
+    let counts = streams.resource_counts();
+    let node = streams.stats_registry.node();
+    let without_segments = u64::try_from(counts.partitions)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(node.partitions_with_segments_inconsistent());
+    StatsTotals {
+        counts,
+        segments_count: node
+            .segments_count_inconsistent()
+            .saturating_add(without_segments),
+        messages_size_bytes: node.size_bytes_inconsistent(),
+        messages_count: node.messages_count_inconsistent(),
     }
-    Ok((
-        usize_to_u32(streams.items.len())?,
-        topics_count,
-        partitions_count,
-        segments_count,
-        messages_size_bytes,
-        messages_count,
-    ))
 }
 
 fn build_stats_response<B, MJ, S, SB>(
@@ -569,27 +568,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let (
-        streams_count,
-        topics_count,
-        partitions_count,
-        segments_count,
-        messages_size_bytes,
-        messages_count,
-    ) = shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .read(aggregate_stats_totals)?;
-    let consumer_groups_count = usize_to_u32(
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .consumer_group_count(),
-    )?;
+    let totals = shard.plane.metadata().mux_stm.streams().read(stats_totals);
 
     let system = probe_system_stats();
     Ok(StatsResponse {
@@ -603,14 +582,14 @@ where
         start_time: system.start_time,
         read_bytes: system.read_bytes,
         written_bytes: system.written_bytes,
-        messages_size_bytes,
-        streams_count,
-        topics_count,
-        partitions_count,
-        segments_count,
-        messages_count,
+        messages_size_bytes: totals.messages_size_bytes,
+        streams_count: usize_to_u32(totals.counts.streams)?,
+        topics_count: usize_to_u32(totals.counts.topics)?,
+        partitions_count: usize_to_u32(totals.counts.partitions)?,
+        segments_count: u32::try_from(totals.segments_count).unwrap_or(u32::MAX),
+        messages_count: totals.messages_count,
         clients_count,
-        consumer_groups_count,
+        consumer_groups_count: usize_to_u32(totals.counts.consumer_groups)?,
         hostname: system.hostname,
         os_name: system.os_name,
         os_version: system.os_version,
@@ -679,6 +658,65 @@ where
         .streams()
         .read(stored_streams);
     listed_streams(&streams).map(|streams| GetStreamsResponse { streams })
+}
+
+/// Streams one page examines at most, matched or not. A page holds the
+/// metadata read guard while it scans, and the writer waits for it.
+const MAX_SCANNED_STREAMS: usize = 65_536;
+
+fn build_get_streams_page_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &GetStreamsPageRequest,
+) -> Result<GetStreamsPageResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let (streams, next_after_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| stored_streams_page(streams, request, MAX_SCANNED_STREAMS))?;
+    Ok(GetStreamsPageResponse {
+        streams: listed_streams(&streams)?,
+        next_after_id: next_after_id.map(usize_to_u32).transpose()?,
+    })
+}
+
+/// The streams after `request.after_id` whose name matches, and the cursor of
+/// the next page. The page ends at `request.limit` matches or `scan_budget`
+/// examined streams. The cursor is the last examined id, or `None` when no
+/// stream follows it.
+fn stored_streams_page(
+    streams: &StreamsInner,
+    request: &GetStreamsPageRequest,
+    scan_budget: usize,
+) -> Result<(Vec<StoredEntry>, Option<usize>), IggyError> {
+    if !(1..=MAX_STREAMS_PAGE_LIMIT).contains(&request.limit) {
+        return Err(IggyError::InvalidCommand);
+    }
+    let limit = request.limit as usize;
+    let name = request.name.as_ref().map(WireName::as_str);
+    let mut page = Vec::with_capacity(limit);
+    let mut examined = 0;
+    let mut items = streams
+        .items
+        .iter_from(request.after_id.map_or(0, |id| id as usize + 1))
+        .peekable();
+    while let Some((id, stream)) = items.next() {
+        examined += 1;
+        if name.is_none_or(|name| stream.name.contains(name)) {
+            page.push(StoredEntry::from(stream));
+        }
+        if page.len() == limit || examined == scan_budget {
+            return Ok((page, items.peek().map(|_| id)));
+        }
+    }
+    Ok((page, None))
 }
 
 fn stored_streams(streams: &StreamsInner) -> Vec<StoredEntry> {
@@ -1126,7 +1164,14 @@ impl NonReplicatedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{HeaderKey, OptionValue};
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_common::{HeaderKey, OptionValue, PartitionStats};
+    use metadata::stm::StateHandler;
     use std::str::FromStr;
 
     #[test]
@@ -1295,70 +1340,221 @@ mod tests {
         assert_eq!(entry.default_value.as_ref(), 2_u32.to_le_bytes());
     }
 
+    fn streams_named(names: &[&str]) -> StreamsInner {
+        let mut streams = StreamsInner::new();
+        for name in names {
+            let mut stream = Stream::new(Arc::from(*name), IggyTimestamp::from(1u64));
+            stream.id = streams.items.vacant_key();
+            streams.items.insert(stream);
+        }
+        streams
+    }
+
+    fn page_request(
+        after_id: Option<u32>,
+        limit: u32,
+        name: Option<&str>,
+    ) -> GetStreamsPageRequest {
+        GetStreamsPageRequest {
+            after_id,
+            limit,
+            name: name.map(|name| WireName::new(name).unwrap()),
+        }
+    }
+
+    fn page_ids(
+        streams: &StreamsInner,
+        request: &GetStreamsPageRequest,
+        scan_budget: usize,
+    ) -> (Vec<usize>, Option<usize>) {
+        let (page, next) = stored_streams_page(streams, request, scan_budget).unwrap();
+        (page.iter().map(|stream| stream.id).collect(), next)
+    }
+
+    #[test]
+    fn given_streams_with_a_hole_when_paging_should_walk_every_stream_once() {
+        let mut streams = streams_named(&["a", "b", "c", "d", "e", "f"]);
+        streams.items.remove(2);
+        let mut seen = Vec::new();
+        let mut after_id = None;
+        let mut pages = 0;
+        loop {
+            let (ids, next) = page_ids(&streams, &page_request(after_id, 2, None), usize::MAX);
+            seen.extend(ids);
+            pages += 1;
+            let Some(next) = next else { break };
+            after_id = Some(u32::try_from(next).unwrap());
+        }
+        assert_eq!(seen, [0, 1, 3, 4, 5]);
+        assert_eq!(pages, 3);
+    }
+
+    #[test]
+    fn given_a_page_that_ends_on_the_last_stream_when_paging_should_report_the_end() {
+        let streams = streams_named(&["a", "b", "c"]);
+        assert_eq!(
+            page_ids(&streams, &page_request(Some(0), 2, None), usize::MAX),
+            (vec![1, 2], None),
+            "a full page with nothing after it must not ask for another page"
+        );
+        assert_eq!(
+            page_ids(&streams, &page_request(Some(2), 2, None), usize::MAX),
+            (vec![], None)
+        );
+    }
+
+    #[test]
+    fn given_a_name_when_paging_should_return_only_streams_containing_it_case_sensitive() {
+        let streams = streams_named(&["orders-eu", "users", "Orders-x", "us-orders"]);
+        assert_eq!(
+            page_ids(
+                &streams,
+                &page_request(None, 10, Some("orders")),
+                usize::MAX
+            ),
+            (vec![0, 3], None)
+        );
+    }
+
+    #[test]
+    fn given_matches_beyond_the_scan_budget_when_paging_should_stop_with_a_cursor() {
+        let streams = streams_named(&["a", "b", "c", "match"]);
+        let request = page_request(None, 10, Some("match"));
+        assert_eq!(page_ids(&streams, &request, 2), (vec![], Some(1)));
+        assert_eq!(
+            page_ids(&streams, &page_request(Some(1), 10, Some("match")), 2),
+            (vec![3], None)
+        );
+    }
+
+    #[test]
+    fn given_a_limit_outside_the_page_range_when_paging_should_refuse() {
+        let streams = streams_named(&["a"]);
+        for limit in [0, MAX_STREAMS_PAGE_LIMIT + 1] {
+            assert!(
+                matches!(
+                    stored_streams_page(&streams, &page_request(None, limit, None), usize::MAX),
+                    Err(IggyError::InvalidCommand)
+                ),
+                "limit {limit} must be refused"
+            );
+        }
+        assert_eq!(
+            page_ids(
+                &streams,
+                &page_request(None, MAX_STREAMS_PAGE_LIMIT, None),
+                usize::MAX
+            ),
+            (vec![0], None)
+        );
+    }
+
+    /// Applies `request` as a committed prepare would.
+    fn commit(
+        streams: &mut StreamsInner,
+        request: &(impl StateHandler<State = StreamsInner> + std::fmt::Debug),
+    ) {
+        let reply = request.apply(streams, IggyTimestamp::default());
+        assert_eq!(reply.code, 0, "{request:?} must commit");
+    }
+
+    /// One stream, one topic of `partitions` partitions and one consumer group.
+    fn committed_tree(partitions: u32) -> StreamsInner {
+        let mut streams = StreamsInner::new();
+        commit(
+            &mut streams,
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            },
+        );
+        commit(
+            &mut streams,
+            &CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: partitions,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: (0..partitions)
+                    .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
+                        partition_id,
+                        consensus_group_id: u64::from(partition_id) + 1,
+                        members: Vec::new(),
+                    })
+                    .collect(),
+            },
+        );
+        commit(
+            &mut streams,
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("group").unwrap(),
+            },
+        );
+        streams
+    }
+
+    /// The registry entry a shard takes when it builds the partition.
+    fn materialise(streams: &StreamsInner, partition_id: usize) -> Arc<PartitionStats> {
+        let topic = &streams.items[0].topics[0];
+        let partition = topic
+            .partitions
+            .iter()
+            .find(|partition| partition.id == partition_id)
+            .unwrap();
+        streams
+            .stats_registry
+            .partition(0, 0, partition, topic.stats.clone())
+    }
+
     #[test]
     fn stats_totals_count_every_committed_partition_before_it_materialises() {
-        use iggy_common::{StreamStats, TopicStats};
-        use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
-        use std::sync::atomic::AtomicUsize;
-
-        let created_at = IggyTimestamp::from(1u64);
-        let mut streams = StreamsInner::new();
-        let mut stream = Stream::new(Arc::from("stream"), created_at);
-        let topic_stats = Arc::new(TopicStats::new(stream.stats.clone()));
-        stream.topics.insert(Topic {
-            id: 0,
-            name: Arc::from("topic"),
-            created_at,
-            options: iggy_common::ResourceOptions::default(),
-            resolved: iggy_common::TopicResolvedOptions::from(
-                &iggy_common::ResourceOptions::default(),
-            ),
-            stats: topic_stats.clone(),
-            partitions: vec![
-                Partition::new(0, 1, created_at, 0, 0),
-                Partition::new(1, 1, created_at, 0, 0),
-            ],
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            consumer_groups: ahash::AHashMap::default(),
-            consumer_group_index: ahash::AHashMap::default(),
-            next_consumer_group_id: 0,
-            consumer_group_catalog_op: 0,
-            created_op: 0,
-        });
-        streams.items.insert(stream);
+        let streams = committed_tree(2);
 
         // Only partition 0 has materialised. Counting the stream's rolled-up
         // counter reported 1 here, so a caller polling `[stats]` twice saw the
         // total climb to 2 with no write in between (and `get_topic` already
         // reported 2 for the same partitions).
-        let stats = streams.stats_registry.partition(
-            0,
-            0,
-            &Partition::new(0, 1, created_at, 0, 0),
-            topic_stats,
-        );
-        stats.increment_segments_count(1);
-
-        let (_, _, partitions, segments, _, _) =
-            aggregate_stats_totals(&streams).expect("totals aggregate");
-        assert_eq!(partitions, 2);
+        let first = materialise(&streams, 0);
+        first.increment_segments_count(1);
+        first.increment_size_bytes(100);
+        first.increment_messages_count(10);
+        let totals = stats_totals(&streams);
         assert_eq!(
-            segments, 2,
+            totals.counts,
+            ResourceCounts {
+                streams: 1,
+                topics: 1,
+                partitions: 2,
+                consumer_groups: 1,
+            }
+        );
+        assert_eq!(
+            totals.segments_count, 2,
             "an unmaterialised partition must contribute the same floor the detail response reports"
         );
+        assert_eq!(totals.messages_size_bytes, 100);
+        assert_eq!(totals.messages_count, 10);
 
         // Materialising the second partition changes nothing: the total was
         // already the steady-state answer.
-        let late = streams.stats_registry.partition(
-            0,
-            0,
-            &Partition::new(1, 1, created_at, 0, 0),
-            Arc::new(TopicStats::new(Arc::new(StreamStats::default()))),
-        );
-        late.increment_segments_count(1);
-        let (_, _, _, segments_after, _, _) =
-            aggregate_stats_totals(&streams).expect("totals aggregate");
-        assert_eq!(segments_after, 2);
+        materialise(&streams, 1).increment_segments_count(1);
+        assert_eq!(stats_totals(&streams).segments_count, 2);
+
+        first.increment_segments_count(2);
+        assert_eq!(stats_totals(&streams).segments_count, 4);
+
+        // An emptied partition falls back to the floor.
+        first.zero_out_all();
+        let totals = stats_totals(&streams);
+        assert_eq!(totals.segments_count, 2);
+        assert_eq!(totals.messages_size_bytes, 0);
+        assert_eq!(totals.messages_count, 0);
     }
 
     #[test]

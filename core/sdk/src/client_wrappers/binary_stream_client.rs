@@ -19,7 +19,7 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::{
     Identifier, IggyError, Stream, StreamClient, StreamCreateOptions, StreamDetails,
-    StreamUpdateOptions,
+    StreamUpdateOptions, StreamsPage, StreamsPageQuery,
 };
 
 #[async_trait]
@@ -30,6 +30,10 @@ impl StreamClient for ClientWrapper {
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
         super::dispatch_client!(self, StreamClient::get_streams()).await
+    }
+
+    async fn get_streams_page(&self, query: &StreamsPageQuery) -> Result<StreamsPage, IggyError> {
+        super::dispatch_client!(self, StreamClient::get_streams_page(query)).await
     }
 
     async fn create_stream(

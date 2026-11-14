@@ -88,6 +88,9 @@ pub use iggy_common::{
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USER_ID, DEFAULT_ROOT_USERNAME},
 };
 pub use iggy_common::{
+    DEFAULT_STREAMS_PAGE_LIMIT, MAX_STREAMS_PAGE_LIMIT, StreamsPage, StreamsPageQuery,
+};
+pub use iggy_common::{
     MAX_METADATA_CHANGES_LIMIT, MetadataChange, MetadataChangeCursor, MetadataChangeGroup,
     MetadataChangeKind, MetadataChangePhase, MetadataChangeRecord, MetadataChangeStart,
     MetadataChangeStatus, MetadataChanges, MetadataChangesQuery, MetadataConsumerGroupCreated,

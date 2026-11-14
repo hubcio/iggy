@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod page;
+
 use crate::{
     HeaderKey, IggyByteSize, IggyTimestamp, OptionKey, ResourceOptions, StreamEncryptionSource,
     Topic,
 };
+pub use page::{DEFAULT_STREAMS_PAGE_LIMIT, MAX_STREAMS_PAGE_LIMIT, StreamsPage, StreamsPageQuery};
 use serde::{Deserialize, Serialize};
 
 /// `Stream` represents the highest level of logical separation of data.

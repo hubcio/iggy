@@ -24,10 +24,14 @@ under the License.
   import { page } from '$app/state';
   import { openModal } from '#lib/components/Modals/AppModals.svelte';
   import Button from '#lib/components/Button.svelte';
+  import { STREAM_PAGE_LIMIT } from '#lib/api/streamPages.js';
 
   import { typedRoute } from '#lib/types/appRoutes.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { resolve } from '$app/paths';
+  import { _showStreams, _streamList } from './+layout';
+
+  const SEARCH_DEBOUNCE_MILLIS = 300;
 
   interface Props {
     data: any;
@@ -36,15 +40,30 @@ under the License.
 
   let { data, children }: Props = $props();
 
-  let searchQuery = $state('');
+  let searchQuery = $state(_streamList.name);
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
 
-  let filteredData = $derived(data.streams.filter((stream) => stream.name.includes(searchQuery)));
+  function scheduleSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      if (searchQuery !== _streamList.name) {
+        void _showStreams(searchQuery, STREAM_PAGE_LIMIT);
+      }
+    }, SEARCH_DEBOUNCE_MILLIS);
+  }
+
+  // Reads `_streamList`, not `data`, so a search that is still loading is not undone.
+  function loadMore() {
+    return _showStreams(_streamList.name, _streamList.count + STREAM_PAGE_LIMIT);
+  }
 
   onMount(() => {
     if (data.streams.length > 0 && page.url.pathname === resolve(typedRoute('dashboard/streams'))) {
       goto(resolve(typedRoute(`dashboard/streams/${data.streams[0].id}`)));
     }
   });
+
+  onDestroy(() => clearTimeout(searchTimer));
 </script>
 
 <div class="flex h-full flex-row">
@@ -53,19 +72,20 @@ under the License.
       <Icon name="search" class="absolute text-gray-400 left-3 top-1/2 -translate-y-1/2 w-[20px]" />
       <input
         bind:value={searchQuery}
+        oninput={scheduleSearch}
         placeholder="Search streams..."
         class="outline-hidden text-sm bg-transparent w-full ml-2 dark:text-white"
       />
     </div>
 
-    {#if filteredData.length === 0}
+    {#if data.streams.length === 0}
       <div class="p-7 py-4 flex items-center justify-center text-sm text-gray-400">
         <em>No streams found.</em>
       </div>
     {/if}
 
     <ul class="flex-1 overflow-auto">
-      {#each filteredData as { name, id, topicsCount, messagesCount, sizeBytes } (id)}
+      {#each data.streams as { name, id, topicsCount, messagesCount, sizeBytes } (id)}
         {@const isActive = page.params.streamId === id.toString()}
         <li class="last:mb-6">
           <a
@@ -97,6 +117,11 @@ under the License.
           </a>
         </li>
       {/each}
+      {#if data.nextAfterId !== null}
+        <li class="p-5">
+          <Button variant="text" class="w-full" onclick={loadMore}>Load more</Button>
+        </li>
+      {/if}
     </ul>
 
     <div class="p-5 pb-7">

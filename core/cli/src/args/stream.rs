@@ -66,6 +66,7 @@ pub(crate) enum StreamAction {
     ///  iggy stream list
     ///  iggy stream list --list-mode table
     ///  iggy stream list -l table
+    ///  iggy stream list --name orders
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(StreamListArgs),
 }
@@ -143,6 +144,9 @@ pub(crate) struct StreamListArgs {
     /// List mode (table or list)
     #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
     pub(crate) list_mode: ListMode,
+    /// Only the streams whose name contains this text, case-sensitive
+    #[clap(short, long)]
+    pub(crate) name: Option<String>,
 }
 
 #[cfg(test)]

@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::{Stream as RustStream, StreamDetails as RustStreamDetails};
+use iggy::prelude::{
+    Stream as RustStream, StreamDetails as RustStreamDetails, StreamsPage as RustStreamsPage,
+};
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
+use crate::event_loop::attach_unless_exiting;
 use crate::options::options_by_provenance;
 use crate::topic::Topic;
 use crate::user_headers::UserHeaders;
@@ -220,5 +223,50 @@ impl Stream {
     #[getter]
     pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
         self.inner.encryption_kek_fingerprints()
+    }
+}
+
+/// One page of streams, as `IggyClient.get_streams_page()` returns it.
+///
+/// The page is converted once: `streams` hands back the same objects on every
+/// access.
+#[gen_stub_pyclass]
+#[pyclass(frozen)]
+pub struct StreamsPage {
+    streams: Vec<Py<Stream>>,
+    /// Pass it as `after_id` to read the next page. `None` on the last page.
+    #[pyo3(get)]
+    next_after_id: Option<u32>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl StreamsPage {
+    /// The streams of this page in ascending id order.
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.list[Stream]"))]
+    fn streams(&self, py: Python<'_>) -> Vec<Py<Stream>> {
+        self.streams
+            .iter()
+            .map(|stream| stream.clone_ref(py))
+            .collect()
+    }
+}
+
+impl TryFrom<RustStreamsPage> for StreamsPage {
+    type Error = PyErr;
+
+    fn try_from(page: RustStreamsPage) -> PyResult<Self> {
+        attach_unless_exiting(|py| {
+            let streams = page
+                .streams
+                .into_iter()
+                .map(|stream| Py::new(py, Stream::from(stream)))
+                .collect::<PyResult<_>>()?;
+            Ok(Self {
+                streams,
+                next_after_id: page.next_after_id,
+            })
+        })
     }
 }

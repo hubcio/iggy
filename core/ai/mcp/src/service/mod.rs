@@ -20,9 +20,9 @@ use iggy::prelude::{
     ConsumerOffsetClient, Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage,
     IggyTimestamp, MaxTopicSize, MessageClient, OptionKey, PartitionClient, Partitioning,
     PersonalAccessTokenClient, PollOptions, PollingKind, PollingStrategy, SegmentClient,
-    StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType,
-    TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
-    UserUpdateOptions,
+    StreamClient, StreamCreateOptions, StreamUpdateOptions, StreamsPageQuery, SystemClient,
+    SystemSnapshotType, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -108,6 +108,27 @@ impl IggyService {
     pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
         request(self.client.get_streams().await)
+    }
+
+    #[tool(
+        description = "Get one page of streams in ascending id, optionally only those whose name contains a text. Pass next_after_id of the reply as after_id for the next page, a null next_after_id is the last page"
+    )]
+    pub async fn get_streams_page(
+        &self,
+        Parameters(GetStreamsPage {
+            after_id,
+            limit,
+            name,
+        }): Parameters<GetStreamsPage>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        let defaults = StreamsPageQuery::default();
+        let query = StreamsPageQuery {
+            after_id,
+            limit: limit.unwrap_or(defaults.limit),
+            name,
+        };
+        request(self.client.get_streams_page(&query).await)
     }
 
     #[tool(description = "Create stream")]

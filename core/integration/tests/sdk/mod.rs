@@ -32,3 +32,4 @@ mod raw;
 mod reader_positions;
 mod send_confirmation;
 mod stream_builder;
+mod streams_page;

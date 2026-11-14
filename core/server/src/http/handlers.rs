@@ -35,8 +35,8 @@ use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_METADATA_CHANGES_CODE,
     GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
-    POLL_MESSAGES_CODE,
+    GET_STREAMS_CODE, GET_STREAMS_PAGE_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
@@ -52,7 +52,8 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsPageRequest,
+    GetStreamsRequest,
 };
 use iggy_binary_protocol::requests::system::{
     DescribeOptionsRequest, GetStatsRequest, ResourceTarget, UpdateResourceRequest,
@@ -72,6 +73,7 @@ use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetCo
 use iggy_binary_protocol::responses::personal_access_tokens::GetPersonalAccessTokensResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_streams_page::GetStreamsPageResponse;
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
@@ -105,11 +107,13 @@ use iggy_common::{
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
     MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
     PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
-    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
-    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
+    SendMessagesConfirmations, Stats, Stream, StreamDetails, StreamsPage, StreamsPageQuery,
+    TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable, descriptors_for,
+    erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+use metadata::stm::stream::StreamsInner;
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
@@ -339,6 +343,39 @@ pub(in crate::http) async fn get_streams(
     Ok(Json(
         streams_from_wire(response).map_err(ReadError::Rejected)?,
     ))
+}
+
+/// `GET /stream-pages`: one page of streams in ascending id, see
+/// [`StreamsPageQuery`]. An unknown, repeated or malformed parameter is a 400,
+/// so a typo cannot silently restart a walk at the first page.
+pub(in crate::http) async fn get_streams_page(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<StreamsPage>, ReadError> {
+    let query = StreamsPageQuery::from_http_query(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(ReadError::Rejected)?;
+    let body = GetStreamsPageRequest::try_from(&query)
+        .map_err(ReadError::Rejected)?
+        .to_bytes();
+    let bytes = SendWrapper::new(read_local(
+        &state,
+        &identity,
+        Consistency::Serializable,
+        GET_STREAMS_PAGE_CODE,
+        &body,
+        Permissioner::get_streams,
+    ))
+    .await?;
+    let response = GetStreamsPageResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    StreamsPage::try_from(response)
+        .map(Json)
+        .map_err(ReadError::Rejected)
 }
 
 /// `GET /streams/{stream_id}`: fetch one stream by numeric id or name as the
@@ -672,64 +709,24 @@ pub(in crate::http) async fn get_metrics(
         .users()
         .authorize(|permissioner| permissioner.get_stats(identity.user_id))
         .is_ok();
-    let (
-        (streams_count, topics_count, partitions_count, segments_count, messages_count),
-        topic_usage,
-    ) = state
+    let topic_gauges = exports_stats && state.server_config.http.metrics.topic_gauges;
+    let (counts, segments_count, messages_count, topic_usage) = state
         .shard
         .plane
         .metadata()
         .mux_stm
         .streams()
         .read(|streams| {
-            let mut topics_count = 0u64;
-            let mut partitions_count = 0u64;
-            let mut segments_count = 0u64;
-            let mut messages_count = 0u64;
-            let mut topic_usage = if exports_stats {
-                Vec::with_capacity(
-                    streams
-                        .items
-                        .iter()
-                        .map(|(_, stream)| stream.topics.len())
-                        .sum(),
-                )
-            } else {
-                Vec::new()
-            };
-            for (_, stream) in &streams.items {
-                topics_count = topics_count.saturating_add(stream.topics.len() as u64);
-                segments_count = segments_count
-                    .saturating_add(u64::from(stream.stats.segments_count_inconsistent()));
-                messages_count =
-                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                for (_, topic) in &stream.topics {
-                    partitions_count =
-                        partitions_count.saturating_add(topic.partitions.len() as u64);
-                    if !exports_stats {
-                        continue;
-                    }
-                    topic_usage.push(TopicUsageSample {
-                        stream: Arc::clone(&stream.name),
-                        topic: Arc::clone(&topic.name),
-                        size_bytes: topic.stats.size_bytes_inconsistent(),
-                        messages: topic.stats.messages_count_inconsistent(),
-                        max_size_bytes: topic
-                            .resolved
-                            .max_topic_size
-                            .resolve(DEFAULT_MAX_TOPIC_SIZE),
-                    });
-                }
-            }
+            let node = streams.stats_registry.node();
             (
-                (
-                    streams.items.len() as u64,
-                    topics_count,
-                    partitions_count,
-                    segments_count,
-                    messages_count,
-                ),
-                topic_usage,
+                streams.resource_counts(),
+                node.segments_count_inconsistent(),
+                node.messages_count_inconsistent(),
+                if topic_gauges {
+                    topic_usage_samples(streams)
+                } else {
+                    Vec::new()
+                },
             )
         });
     let users_count = state
@@ -741,15 +738,38 @@ pub(in crate::http) async fn get_metrics(
         .read(|users| users.items.len() as u64);
 
     let metrics = &state.metrics;
-    metrics.streams.set(gauge_value(streams_count));
-    metrics.topics.set(gauge_value(topics_count));
-    metrics.partitions.set(gauge_value(partitions_count));
+    metrics.streams.set(gauge_value(counts.streams as u64));
+    metrics.topics.set(gauge_value(counts.topics as u64));
+    metrics
+        .partitions
+        .set(gauge_value(counts.partitions as u64));
     metrics.segments.set(gauge_value(segments_count));
     metrics.messages.set(gauge_value(messages_count));
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
     Ok(metrics.formatted_output(exports_stats))
+}
+
+/// One sample per topic for the per-topic series, the only part of a scrape
+/// that walks the topics.
+fn topic_usage_samples(streams: &StreamsInner) -> Vec<TopicUsageSample> {
+    let mut samples = Vec::with_capacity(streams.resource_counts().topics);
+    for (_, stream) in &streams.items {
+        for (_, topic) in &stream.topics {
+            samples.push(TopicUsageSample {
+                stream: Arc::clone(&stream.name),
+                topic: Arc::clone(&topic.name),
+                size_bytes: topic.stats.size_bytes_inconsistent(),
+                messages: topic.stats.messages_count_inconsistent(),
+                max_size_bytes: topic
+                    .resolved
+                    .max_topic_size
+                    .resolve(DEFAULT_MAX_TOPIC_SIZE),
+            });
+        }
+    }
+    samples
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP

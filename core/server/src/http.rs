@@ -74,7 +74,7 @@ use crate::http::handlers::{
     delete_pat_named_login, delete_segments, delete_stream, delete_topic, delete_user,
     describe_options, get_cg, get_cgs, get_client, get_clients, get_cluster_metadata,
     get_consumer_offset, get_metadata_changes, get_pats, get_snapshot, get_stats, get_stream,
-    get_streams, get_topic, get_topics, get_user, get_users, login_user,
+    get_streams, get_streams_page, get_topic, get_topics, get_user, get_users, login_user,
     login_with_personal_access_token, logout_user, ping, poll_messages, poll_messages_committing,
     poll_messages_deferred, refresh_token, send_messages, store_consumer_offset,
     update_permissions, update_stream, update_topic, update_user,
@@ -516,6 +516,9 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         // `DELETE /users/logout` never misroutes to `delete_user`.
         .route("/users/logout", delete(logout_user))
         .route("/streams", get(get_streams).post(create_stream))
+        // Not `/streams/page`: `/streams/{stream_id}` also takes a name, and a
+        // static segment there would hide a stream named "page".
+        .route("/stream-pages", get(get_streams_page))
         .route(
             "/streams/{stream_id}",
             get(get_stream).put(update_stream).delete(delete_stream),

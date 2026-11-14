@@ -85,6 +85,10 @@ type Streams =
     }
   | {
       method: 'GET';
+      path: '/stream-pages';
+    }
+  | {
+      method: 'GET';
       path: `/streams/${number}`;
     }
   | {

@@ -29,7 +29,7 @@ use client::{
     delete_connection as delete_client, encode_metadata_changes_query, encryption_key_fingerprint,
     encryption_key_fingerprint_base64, from_connection_string, new_connection,
     parse_metadata_change_cursor, parse_metadata_current_page_token,
-    validate_metadata_changes_query,
+    validate_metadata_changes_query, validate_streams_page_query,
 };
 use consumer::Consumer;
 use messages::{BatchPositions, Checkpoint, Continuation, default_poll_options, make_message};
@@ -156,6 +156,25 @@ mod ffi {
         None = 0,
         Stream = 1,
         Server = 2,
+    }
+
+    /// One request of a walk over the streams in ascending id. `name` travels
+    /// as bytes because a `String` throws in C++ on text that is not UTF-8,
+    /// before the bridge can refuse it as InvalidCommand.
+    struct StreamsPageQuery {
+        has_after_id: bool,
+        after_id: u32,
+        limit: u32,
+        has_name: bool,
+        name: Vec<u8>,
+    }
+
+    /// One page of streams in ascending id. Absent `next_after_id` marks the
+    /// last page.
+    struct StreamsPage {
+        streams: Vec<Stream>,
+        has_next_after_id: bool,
+        next_after_id: u32,
     }
 
     #[repr(u8)]
@@ -965,6 +984,18 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
+        /// Reads one page of the streams in ascending id. Needs the permission
+        /// to read the streams. An invalid query fails with InvalidCommand (3)
+        /// before anything is sent.
+        fn get_streams_page(
+            self: &Client,
+            query: StreamsPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<StreamsPage>;
+        fn validate_streams_page_query(
+            query: StreamsPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(
             self: &Client,

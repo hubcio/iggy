@@ -59,6 +59,7 @@ const (
 	GetStreamsCode            Code = 201
 	CreateStreamCode          Code = 202
 	DeleteStreamCode          Code = 203
+	GetStreamsPageCode        Code = 206
 	GetTopicCode              Code = 300
 	GetTopicsCode             Code = 301
 	CreateTopicCode           Code = 302

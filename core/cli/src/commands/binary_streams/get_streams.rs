@@ -20,7 +20,7 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
-use iggy_common::Client;
+use iggy_common::{Client, MAX_STREAMS_PAGE_LIMIT, StreamsPageQuery};
 use tracing::{Level, event};
 
 pub enum GetStreamsOutput {
@@ -30,11 +30,12 @@ pub enum GetStreamsOutput {
 
 pub struct GetStreamsCmd {
     output: GetStreamsOutput,
+    name: Option<String>,
 }
 
 impl GetStreamsCmd {
-    pub fn new(output: GetStreamsOutput) -> Self {
-        GetStreamsCmd { output }
+    pub fn new(output: GetStreamsOutput, name: Option<String>) -> Self {
+        GetStreamsCmd { output, name }
     }
 }
 
@@ -42,6 +43,7 @@ impl Default for GetStreamsCmd {
     fn default() -> Self {
         GetStreamsCmd {
             output: GetStreamsOutput::Table,
+            name: None,
         }
     }
 }
@@ -53,14 +55,29 @@ impl CliCommand for GetStreamsCmd {
             GetStreamsOutput::Table => "table",
             GetStreamsOutput::List => "list",
         };
-        format!("list streams in {mode} mode")
+        match &self.name {
+            Some(name) => format!("list streams with names containing \"{name}\" in {mode} mode"),
+            None => format!("list streams in {mode} mode"),
+        }
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let streams = client
-            .get_streams()
-            .await
-            .with_context(|| String::from("Problem getting list of streams"))?;
+        // Pages keep each server read short, so a list of every stream does not
+        // hold back metadata writes for its whole length.
+        let mut streams = Vec::new();
+        let mut query = Some(StreamsPageQuery {
+            limit: MAX_STREAMS_PAGE_LIMIT,
+            name: self.name.clone(),
+            ..StreamsPageQuery::default()
+        });
+        while let Some(current) = query {
+            let page = client
+                .get_streams_page(&current)
+                .await
+                .with_context(|| String::from("Problem getting list of streams"))?;
+            query = current.next(&page);
+            streams.extend(page.streams);
+        }
 
         if streams.is_empty() {
             event!(target: PRINT_TARGET, Level::INFO, "No streams found!");

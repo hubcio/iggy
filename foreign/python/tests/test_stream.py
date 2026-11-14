@@ -17,9 +17,12 @@
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, IggyError
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
+
+INVALID_COMMAND = 3
+MAX_STREAMS_PAGE_LIMIT = 1000
 
 
 class TestStreamOperations:
@@ -281,6 +284,58 @@ class TestGetStreams:
         await client.connect()
         with pytest.raises(RuntimeError):
             await client.get_streams()
+
+
+class TestGetStreamsPage:
+    """Test listing streams page by page via get_streams_page."""
+
+    @pytest.mark.asyncio
+    async def test_given_a_name_filter_when_walking_pages_should_list_each_match_once(
+        self, transport_client: IggyClient, unique_name
+    ):
+        """One stream per page, in id order, until the last page."""
+        marker = unique_name("page")
+        matched = [f"{marker}-{index}" for index in range(3)]
+        for name in [*matched, unique_name("other")]:
+            await transport_client.create_stream(name)
+
+        listed = []
+        after_id = None
+        while True:
+            page = await transport_client.get_streams_page(
+                after_id=after_id, limit=1, name=marker
+            )
+            assert len(page.streams) <= 1
+            assert all(
+                first is second
+                for first, second in zip(page.streams, page.streams, strict=True)
+            )
+            listed.extend(page.streams)
+            if page.next_after_id is None:
+                break
+            after_id = page.next_after_id
+
+        assert sorted(stream.name for stream in listed) == sorted(matched)
+        assert [stream.id for stream in listed] == sorted(
+            stream.id for stream in listed
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {"limit": 0},
+            {"limit": MAX_STREAMS_PAGE_LIMIT + 1},
+            {"name": ""},
+        ],
+    )
+    async def test_given_a_refused_query_when_paging_should_raise_before_sending(
+        self, iggy_client: IggyClient, query: dict
+    ):
+        """The client refuses what the server would, before any I/O."""
+        with pytest.raises(IggyError) as refusal:
+            iggy_client.get_streams_page(**query)
+        assert refusal.value.code == INVALID_COMMAND
 
 
 class TestUpdateStream:

@@ -68,9 +68,9 @@ use iggy_common::{
     MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
     MetadataUserPermissionsUpdated, Permissions as RustPermissions,
     PersonalAccessTokenInfo as RustPersonalAccessTokenInfo, Stats as RustStats,
-    StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
-    TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
-    UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
+    StreamPermissions as RustStreamPermissions, StreamsPage, StreamsPageQuery,
+    TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
+    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 
 use crate::{ffi, messages::BatchPositions};
@@ -905,6 +905,32 @@ impl From<RustStream> for ffi::Stream {
             has_encryption_key_fingerprint: fingerprint.is_some(),
             encryption_key_fingerprint: fingerprint.unwrap_or_default(),
             encryption_kek_fingerprints: kek_fingerprints,
+        }
+    }
+}
+
+impl TryFrom<ffi::StreamsPageQuery> for StreamsPageQuery {
+    type Error = IggyError;
+
+    fn try_from(query: ffi::StreamsPageQuery) -> Result<Self, Self::Error> {
+        let name = query
+            .has_name
+            .then(|| String::from_utf8(query.name).map_err(|_| IggyError::InvalidCommand))
+            .transpose()?;
+        Ok(Self {
+            after_id: query.has_after_id.then_some(query.after_id),
+            limit: query.limit,
+            name,
+        })
+    }
+}
+
+impl From<StreamsPage> for ffi::StreamsPage {
+    fn from(page: StreamsPage) -> Self {
+        ffi::StreamsPage {
+            streams: page.streams.into_iter().map(ffi::Stream::from).collect(),
+            has_next_after_id: page.next_after_id.is_some(),
+            next_after_id: page.next_after_id.unwrap_or_default(),
         }
     }
 }

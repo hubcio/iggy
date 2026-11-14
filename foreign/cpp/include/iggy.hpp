@@ -67,6 +67,8 @@ class Topic;
 class TopicDetails;
 class Stream;
 class StreamDetails;
+class StreamsPage;
+class StreamsPageQuery;
 class GlobalPermissions;
 class Permissions;
 class StreamPermissions;
@@ -116,8 +118,8 @@ decltype(auto) RethrowAsIggyException(Operation &&operation);
  * Code() and Kind() are available only when a call forwards a typed Rust SDK
  * error. IggyBlockingClient documents the covered methods. Other calls and
  * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
- * except the metadata change calls, which report invalid input with the kind
- * each one documents.
+ * except the stream page and metadata change calls, which report invalid input
+ * with the kind each one documents.
  * OperationId() is present only for operation_uncertain, lane_blocked,
  * operation_not_retained, partition_lane_blocked and fetch_progress_uncertain
  * errors and preserves the full unsigned 64-bit ID. BlockedPartitionId() is
@@ -2065,6 +2067,7 @@ class Stream final {
     static Stream FromFfi(ffi::Stream stream);
 
     friend class IggyBlockingClient;
+    friend class StreamsPage;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -2076,6 +2079,113 @@ class Stream final {
     std::optional<StreamEncryptionSource> encryption_key_source_;
     std::optional<std::string> encryption_key_fingerprint_;
     std::vector<std::string> encryption_kek_fingerprints_;
+};
+
+/**
+ * @brief One request of a walk over the streams in ascending ID.
+ *
+ * The default query reads the first page, up to kDefaultLimit streams, with no
+ * name filter. IggyBlockingClient::GetStreamsPage() refuses an invalid query
+ * with Kind() invalid_command before anything is sent.
+ *
+ * A new stream takes the lowest free ID, so a stream created during a walk can
+ * land behind the walk and miss it.
+ */
+class StreamsPageQuery final {
+  public:
+    static constexpr std::uint32_t kDefaultLimit = 100;
+    static constexpr std::uint32_t kMaxLimit     = 1000;
+
+    StreamsPageQuery() = default;
+
+    /** @brief Returns the ID the page starts after, absent for the first page. */
+    [[nodiscard]] std::optional<std::uint32_t> AfterId() const noexcept { return after_id_; }
+
+    /** @brief Returns the most streams one page returns. */
+    [[nodiscard]] std::uint32_t Limit() const noexcept { return limit_; }
+
+    /** @brief Returns the text a listed stream name contains, absent when every stream is listed. */
+    [[nodiscard]] const std::optional<std::string> &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Reads the streams after @p after_id.
+     * @param after_id StreamsPage::NextAfterId() of the previous page.
+     * @return Reference to this query.
+     */
+    StreamsPageQuery &SetAfterId(std::uint32_t after_id) {
+        after_id_ = after_id;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the most streams one page returns.
+     * @param limit From 1 to kMaxLimit. The default is kDefaultLimit.
+     * @return Reference to this query.
+     */
+    StreamsPageQuery &SetLimit(std::uint32_t limit) {
+        limit_ = limit;
+        return *this;
+    }
+
+    /**
+     * @brief Lists only the streams whose name contains @p name, case-sensitive.
+     * @param name From 1 to 255 bytes of UTF-8.
+     * @return Reference to this query.
+     */
+    StreamsPageQuery &SetName(std::string name) {
+        name_ = std::move(name);
+        return *this;
+    }
+
+    /**
+     * @brief Applies the checks GetStreamsPage() runs before sending.
+     * @throws IggyException with Kind() invalid_command when the limit is
+     *         outside 1 to kMaxLimit, or the name is empty, longer than 255
+     *         bytes, or not UTF-8.
+     */
+    void Validate() const;
+
+  private:
+    [[nodiscard]] ffi::StreamsPageQuery ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    std::optional<std::uint32_t> after_id_;
+    std::uint32_t limit_{kDefaultLimit};
+    std::optional<std::string> name_;
+};
+
+/**
+ * @brief One page of stream summaries in ascending ID.
+ *
+ * IggyBlockingClient::GetStreamsPage() returns this value. While NextAfterId()
+ * is set, pass it to StreamsPageQuery::SetAfterId() to read the next page.
+ */
+class StreamsPage final {
+  public:
+    /** @brief Returns the streams of the page in ascending ID. */
+    [[nodiscard]] const std::vector<Stream> &Streams() const noexcept { return streams_; }
+
+    /**
+     * @brief Returns the ID the next page starts after.
+     *
+     * The server scans a bounded number of streams per page, so a page can
+     * hold fewer streams than the limit, or none, while this is set.
+     * @return ID for StreamsPageQuery::SetAfterId(), or `std::nullopt` after
+     *         the last page.
+     */
+    [[nodiscard]] std::optional<std::uint32_t> NextAfterId() const noexcept { return next_after_id_; }
+
+  private:
+    StreamsPage(std::vector<Stream> streams, std::optional<std::uint32_t> next_after_id)
+        : streams_(std::move(streams)), next_after_id_(next_after_id) {}
+
+    static StreamsPage FromFfi(ffi::StreamsPage page);
+
+    friend class IggyBlockingClient;
+
+    std::vector<Stream> streams_;
+    std::optional<std::uint32_t> next_after_id_;
 };
 
 /**
@@ -6475,13 +6585,13 @@ class IggyConsumer final {
  *   DeleteConsumerPosition().
  * - PollMessages(), Reader(), StandaloneConsumer(), GroupConsumer(),
  *   PendingPoll::Wait(), and the calls of PartitionReader and IggyConsumer.
- * - GetMetadataChanges().
+ * - GetStreamsPage() and GetMetadataChanges().
  *
  * Other methods report errors through the exception message only. C++ and
  * bridge-local argument validation failures also have no structured error
- * details, even for the methods listed above. GetMetadataChanges() is the
- * exception: it reports every invalid query as invalid_command, including one
- * the bridge refuses.
+ * details, even for the methods listed above. GetStreamsPage() and
+ * GetMetadataChanges() are the exceptions: they report every invalid query as
+ * invalid_command, including one the bridge refuses.
  *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
@@ -6906,6 +7016,23 @@ class IggyBlockingClient final {
      *         permission to read streams, or the request fails.
      */
     std::vector<Stream> GetStreams();
+
+    /**
+     * @brief Reads one page of stream summaries in ascending ID.
+     *
+     * Reads a large stream list in bounded replies. Start with a default
+     * StreamsPageQuery and, while StreamsPage::NextAfterId() is set, pass it
+     * to StreamsPageQuery::SetAfterId() to read the next page. A page can hold
+     * fewer streams than the limit, or none, before the last page.
+     *
+     * @param query Position, page size, and name filter.
+     * @return One page of the stream summaries visible to the authenticated user.
+     * @throws IggyException with Kind() invalid_command when @p query is
+     *         invalid, before anything is sent; or if the client is
+     *         unavailable, the caller lacks permission to read streams, or the
+     *         request fails.
+     */
+    StreamsPage GetStreamsPage(const StreamsPageQuery &query);
 
     /**
      * @brief Retrieves one stream by numeric ID or name.

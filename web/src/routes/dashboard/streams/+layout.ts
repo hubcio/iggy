@@ -15,17 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { invalidate } from '$app/navigation';
 import { clientApi } from '#lib/api/clientApi.js';
-import { streamMapper, type Stream } from '#lib/domain/Stream.js';
+import {
+  STREAM_PAGE_LIMIT,
+  readStreams,
+  type StreamListView,
+  type StreamPage
+} from '#lib/api/streamPages.js';
+import { streamMapper } from '#lib/domain/Stream.js';
 import type { LayoutLoad } from './$types';
 
-export const load: LayoutLoad = async () => {
-  const data = await clientApi<any[]>({
-    method: 'GET',
-    path: '/streams'
-  });
+const STREAM_LIST_DEPENDENCY = 'app:stream-list';
+
+// Kept here, not in the component, because the periodic refresh reruns `load`
+// and must read the same streams the list shows. Module state is safe because
+// the app renders only in the browser (`ssr = false`). SvelteKit allows other
+// exports from a load module only with a `_` prefix.
+export const _streamList: StreamListView = { name: '', count: STREAM_PAGE_LIMIT };
+
+export function _showStreams(name: string, count: number): Promise<void> {
+  _streamList.name = name;
+  _streamList.count = count;
+  return invalidate(STREAM_LIST_DEPENDENCY);
+}
+
+export const load: LayoutLoad = async ({ depends }) => {
+  depends(STREAM_LIST_DEPENDENCY);
+  const page = await readStreams(_streamList, (queryParams) =>
+    clientApi<StreamPage>({ method: 'GET', path: '/stream-pages', queryParams })
+  );
 
   return {
-    streams: (data.map(streamMapper) as Stream[]).sort((a, b) => b.createdAt - a.createdAt)
+    streams: page.streams.map(streamMapper),
+    nextAfterId: page.next_after_id
   };
 };

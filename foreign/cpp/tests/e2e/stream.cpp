@@ -18,12 +18,24 @@
  */
 
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "lib.rs.h"
 #include "tests/e2e/test_helpers.hpp"
+
+namespace {
+
+constexpr std::uint32_t kInvalidCommand    = 3;
+constexpr std::uint32_t kPagedStreamsCount = 5;
+constexpr std::uint32_t kStreamsPageLimit  = 2;
+
+}  // namespace
 
 class E2E_Stream : public E2ETestFixture {};
 
@@ -600,4 +612,60 @@ TEST_F(E2E_Stream, GetStreamsRepeatedCallsReturnSameResult) {
     ASSERT_TRUE(contains_stream(streams1)) << "Stream not found in first call";
     ASSERT_TRUE(contains_stream(streams2)) << "Stream not found in second call";
     ASSERT_TRUE(contains_stream(streams3)) << "Stream not found in third call";
+}
+
+TEST_F(E2E_Stream, GetStreamsPageListsEachFilteredStreamOnceInAscendingIdOrder) {
+    RecordProperty("description", "Walks filtered pages and lists each created stream once in ascending ID order.");
+    const std::string shared_name_part = GetRandomName(32);
+    auto client                        = GetLoggedInHighLevelClient();
+    std::map<std::uint32_t, std::string> created;
+    for (std::uint32_t index = 0; index < kPagedStreamsCount; ++index) {
+        const std::string stream_name = "page-" + std::to_string(index) + "-" + shared_name_part;
+        created.emplace(client.CreateStream(stream_name).Id(), stream_name);
+        TrackStream(stream_name);
+    }
+
+    auto query = iggy::StreamsPageQuery().SetLimit(kStreamsPageLimit).SetName(shared_name_part);
+    std::vector<std::pair<std::uint32_t, std::string>> walked;
+    while (true) {
+        const auto page = client.GetStreamsPage(query);
+        ASSERT_LE(page.Streams().size(), kStreamsPageLimit);
+        for (const auto &stream : page.Streams()) {
+            walked.emplace_back(stream.Id(), stream.Name());
+        }
+        const auto next_after_id = page.NextAfterId();
+        if (!next_after_id) {
+            break;
+        }
+        // A cursor that does not move would page forever.
+        if (query.AfterId()) {
+            ASSERT_GT(*next_after_id, *query.AfterId());
+        }
+        query.SetAfterId(*next_after_id);
+    }
+
+    const std::vector<std::pair<std::uint32_t, std::string>> expected(created.begin(), created.end());
+    EXPECT_EQ(walked, expected);
+}
+
+TEST_F(E2E_Stream, GetStreamsPageRefusesInvalidQueriesWithInvalidCommand) {
+    RecordProperty("description", "Refuses invalid limits and name filters with invalid_command (3).");
+    auto client = GetLoggedInHighLevelClient();
+
+    const std::pair<const char *, iggy::StreamsPageQuery> refused[] = {
+        {"zero limit", iggy::StreamsPageQuery().SetLimit(0)},
+        {"limit above the maximum", iggy::StreamsPageQuery().SetLimit(iggy::StreamsPageQuery::kMaxLimit + 1)},
+        {"empty name", iggy::StreamsPageQuery().SetName("")},
+        {"name that is not UTF-8", iggy::StreamsPageQuery().SetName("\xff")},
+    };
+    for (const auto &[description, query] : refused) {
+        SCOPED_TRACE(description);
+        try {
+            client.GetStreamsPage(query);
+            ADD_FAILURE() << "an invalid query must be refused";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_EQ(error.Code(), std::optional<std::uint32_t>(kInvalidCommand)) << error.what();
+            EXPECT_EQ(error.Kind(), "invalid_command") << error.what();
+        }
+    }
 }

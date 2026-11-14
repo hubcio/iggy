@@ -100,6 +100,7 @@ internal static class VsrOperations
         CommandCodes.GET_CONSUMER_OFFSET_CODE,
         CommandCodes.GET_STREAM_CODE,
         CommandCodes.GET_STREAMS_CODE,
+        CommandCodes.GET_STREAMS_PAGE_CODE,
         CommandCodes.GET_TOPIC_CODE,
         CommandCodes.GET_TOPICS_CODE,
         CommandCodes.GET_CONSUMER_GROUP_CODE,

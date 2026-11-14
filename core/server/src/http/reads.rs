@@ -588,8 +588,8 @@ pub(in crate::http) mod tests {
     use hyper_util::service::TowerToHyperService;
     use iggy_binary_protocol::codes::{
         DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-        GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-        GET_USER_CODE, GET_USERS_CODE,
+        GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_STREAMS_PAGE_CODE, GET_TOPIC_CODE,
+        GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
     };
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
@@ -1558,6 +1558,7 @@ pub(in crate::http) mod tests {
     fn given_the_http_read_codes_when_classified_should_gate_all_but_the_static_catalog() {
         for code in [
             GET_STREAMS_CODE,
+            GET_STREAMS_PAGE_CODE,
             GET_STREAM_CODE,
             GET_TOPICS_CODE,
             GET_TOPIC_CODE,

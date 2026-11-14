@@ -325,6 +325,34 @@ Stream Stream::FromFfi(ffi::Stream stream) {
                   TextsFromFfi(stream.encryption_kek_fingerprints));
 }
 
+ffi::StreamsPageQuery StreamsPageQuery::ToFfi() const {
+    ffi::StreamsPageQuery query{};
+    query.has_after_id = after_id_.has_value();
+    query.after_id     = after_id_.value_or(0);
+    query.limit        = limit_;
+    query.has_name     = name_.has_value();
+    if (name_) {
+        query.name.reserve(name_->size());
+        for (const char character : *name_) {
+            query.name.push_back(static_cast<std::uint8_t>(character));
+        }
+    }
+    return query;
+}
+
+StreamsPage StreamsPage::FromFfi(ffi::StreamsPage page) {
+    std::vector<Stream> streams;
+    streams.reserve(page.streams.size());
+    for (auto &stream : page.streams) {
+        streams.push_back(Stream::FromFfi(std::move(stream)));
+    }
+    std::optional<std::uint32_t> next_after_id;
+    if (page.has_next_after_id) {
+        next_after_id = page.next_after_id;
+    }
+    return StreamsPage(std::move(streams), next_after_id);
+}
+
 OptionSpec OptionSpec::FromFfi(ffi::OptionSpec spec) {
     return OptionSpec(std::string(spec.key.c_str(), spec.key.size()), static_cast<HeaderKind>(spec.kind),
                       std::vector<std::uint8_t>(spec.default_value.begin(), spec.default_value.end()),
