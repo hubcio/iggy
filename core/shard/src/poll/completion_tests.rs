@@ -232,7 +232,8 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             topic.consumer_groups.insert(group_id, Box::new(group));
         }
         stream.topics.insert(topic);
-        inner.items.insert(stream);
+        inner.items.insert(Arc::new(stream));
+        inner.recompute_consumer_group_metadata();
         let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
         let (owner, _owner_sender) = owner_with_metadata(&bus, config, namespace, metadata);
         owner
@@ -660,7 +661,7 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
     let mut stream = Stream::default();
     stream.topics.insert(topic);
     let mut inner = StreamsInner::default();
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
     let (owner, _inbox) = owner_with_metadata(&bus, config, namespace, metadata);
     owner.shards_table.insert(
@@ -794,7 +795,7 @@ async fn given_a_pending_view_write_when_read_on_primary_should_refuse_until_it_
     let mut stream = Stream::default();
     stream.topics.insert(topic);
     let mut inner = StreamsInner::default();
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let users = Users::default();
     users.ensure_root_user("iggy", "password-hash");
     let metadata = PollTestMetadata::new((users, (inner.into(), ())));
@@ -1036,7 +1037,7 @@ impl BoundPoll {
                 .insert(BOUND_GROUP, Box::new(self.group.clone()));
             stream.topics.insert(topic);
             let mut inner = StreamsInner::default();
-            inner.items.insert(stream);
+            inner.items.insert(Arc::new(stream));
             let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
             let (owner, inbox) =
                 owner_with_metadata(&self.bus, self.config.clone(), self.namespace, metadata);
@@ -1143,7 +1144,7 @@ async fn given_deleted_history_when_metadata_still_lists_the_partition_should_re
     let mut stream = Stream::default();
     stream.topics.insert(topic);
     let mut inner = StreamsInner::default();
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
     let (owner, _owner_sender) = owner_with_metadata(&bus, config.clone(), namespace, metadata);
     owner.shards_table.insert(
@@ -1372,7 +1373,8 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
         }
         topic.consumer_groups.insert(GROUP, Box::new(group));
         stream.topics.insert(topic);
-        inner.items.insert(stream);
+        inner.items.insert(Arc::new(stream));
+        inner.recompute_consumer_group_metadata();
         let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
         let (owner, _sender) = owner_with_metadata(&bus, config.clone(), namespace, metadata);
         owner

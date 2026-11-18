@@ -2044,7 +2044,9 @@ mod tests {
         let reply = apply(&streams, Operation::DeleteConsumerGroup, &delete, context());
         assert_eq!(reply.code, 0);
         let mut inner = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
-        inner.items[0].topics[0].consumer_groups.remove(&0);
+        inner.items.make_mut(0).unwrap().topics[0]
+            .consumer_groups
+            .remove(&0);
 
         let batch =
             CompleteLifecycleRequest::new(INTENT_OP, 0, vec![completion(0, 12), completion(1, 23)])
@@ -2119,7 +2121,9 @@ mod tests {
 
         // The group cannot vanish while its deletion is pending, so the test
         // removes it directly to make the finalization fail and reopen.
-        restored.items[0].topics[0].consumer_groups.remove(&0);
+        restored.items.make_mut(0).unwrap().topics[0]
+            .consumer_groups
+            .remove(&0);
         let last = CompleteLifecycleRequest::new(INTENT_OP, 0, vec![completion(1, 23)]).unwrap();
         assert_ne!(last.apply(&mut restored, IggyTimestamp::now()).code, 0);
         assert_eq!(restored.lifecycle_scopes, both, "reopen");

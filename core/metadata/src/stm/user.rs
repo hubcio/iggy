@@ -23,7 +23,7 @@ use crate::stm::result::{
     DeletePersonalAccessTokenResult, DeleteUserResult, DeletedResource, UpdatePermissionsResult,
     UpdateUserResult,
 };
-use crate::stm::snapshot::Snapshotable;
+use crate::stm::snapshot::{FillSnapshot, MetadataCapture, SnapshotError, Snapshotable};
 use crate::stm::stream::{PatchError, patched_options, public_reply_options};
 use crate::stm::walk::{Directed, range_after};
 use crate::stm::{ApplyContext, StateHandler};
@@ -1351,6 +1351,13 @@ impl UsersInner {
 }
 
 impl_fill_restore!(Users, users);
+
+impl FillSnapshot<MetadataCapture> for Users {
+    fn fill_snapshot(&self, capture: &mut MetadataCapture) -> Result<(), SnapshotError> {
+        capture.users = Some(self.to_snapshot());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

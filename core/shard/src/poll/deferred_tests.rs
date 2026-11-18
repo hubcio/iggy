@@ -127,7 +127,7 @@ async fn shard_of(
     }
     topic.consumer_groups.insert(0, Box::new(group));
     stream.topics.insert(topic);
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let users = Users::default();
     users.ensure_root_user("iggy", "password-hash");
     let metadata = IggyMetadata::new(

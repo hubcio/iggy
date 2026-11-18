@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
 use crate::change_log::{ChangeLogSnapshot, RingSnapshot};
-use crate::stm::stream::StreamsSnapshot;
+use crate::stm::stream::{StreamsCapture, StreamsEncoder, StreamsSnapshot};
 use crate::stm::user::UsersSnapshot;
 
 /// The snapshot format version written by this build.
@@ -364,13 +364,8 @@ impl MetadataSnapshot {
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
         // Bytes carrying no readable version are not a snapshot at all, so they fall
         // through to the deserializer, whose error names what actually went wrong.
-        if let Some(version) = peek_format_version(bytes)
-            && !(MIN_READABLE_SNAPSHOT_FORMAT_VERSION..=SNAPSHOT_FORMAT_VERSION).contains(&version)
-        {
-            return Err(SnapshotError::UnsupportedFormatVersion {
-                found: version,
-                expected: SNAPSHOT_FORMAT_VERSION,
-            });
+        if let Some(version) = peek_format_version(bytes) {
+            ensure_readable_format_version(version)?;
         }
         let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
         snapshot.validate()?;
@@ -384,6 +379,131 @@ impl MetadataSnapshot {
         }
         self.change_log.validate(self.sequence_number)
     }
+}
+
+/// The state of one commit in the shape of [`MetadataSnapshot`], with the streams
+/// section held by pointer.
+///
+/// Taking it copies no stream (see [`StreamsCapture`]), so it can be encoded
+/// while the state machines move on. [`CaptureEncoder`] writes the bytes
+/// [`MetadataSnapshot::encode`] writes for the same state: the fields keep the
+/// order and types of [`MetadataSnapshot`], and the streams section encodes as a
+/// [`StreamsSnapshot`].
+#[derive(Debug)]
+pub struct MetadataCapture {
+    pub(crate) version: u32,
+    pub(crate) created_at: u64,
+    pub(crate) sequence_number: u64,
+    pub(crate) users: Option<UsersSnapshot>,
+    pub(crate) streams: Option<StreamsCapture>,
+    pub(crate) client_table: Option<consensus::ClientTableSnapshot>,
+    pub(crate) change_log: ChangeLogSnapshot,
+    pub(crate) writer_release: u32,
+}
+
+impl MetadataCapture {
+    /// Capture the state machines of `stm`. The client table and the change log
+    /// are not state machines, so the caller folds them in.
+    ///
+    /// # Errors
+    /// Whatever a state machine's [`FillSnapshot`] returns.
+    pub fn create<T>(stm: &T, sequence_number: u64, created_at: u64) -> Result<Self, SnapshotError>
+    where
+        T: FillSnapshot<Self>,
+    {
+        let mut capture = Self {
+            version: SNAPSHOT_FORMAT_VERSION,
+            created_at,
+            sequence_number,
+            users: None,
+            streams: None,
+            client_table: None,
+            change_log: ChangeLogSnapshot::default(),
+            writer_release: SNAPSHOT_WRITER_RELEASE,
+        };
+        stm.fill_snapshot(&mut capture)?;
+        Ok(capture)
+    }
+
+    pub(crate) const fn into_encoder(self) -> CaptureEncoder {
+        CaptureEncoder {
+            capture: self,
+            next: CaptureStep::Head,
+        }
+    }
+}
+
+/// The length of the msgpack array a [`MetadataSnapshot`] encodes as.
+const METADATA_SNAPSHOT_FIELDS: usize = 8;
+
+/// Encodes a [`MetadataCapture`] one step at a time, so a writer can stop
+/// between steps: the fields before the streams, each step of
+/// [`StreamsEncoder`], then the fields after the streams.
+#[derive(Debug)]
+pub(crate) struct CaptureEncoder {
+    capture: MetadataCapture,
+    next: CaptureStep,
+}
+
+#[derive(Debug)]
+enum CaptureStep {
+    Head,
+    Streams(StreamsCapture, StreamsEncoder),
+    Tail,
+    Done,
+}
+
+impl CaptureEncoder {
+    /// Append the next step to `out` and return whether steps remain.
+    pub(crate) fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        match &mut self.next {
+            CaptureStep::Head => {
+                encode_array_len(out, METADATA_SNAPSHOT_FIELDS)?;
+                encode_value(out, &self.capture.version)?;
+                encode_value(out, &self.capture.created_at)?;
+                encode_value(out, &self.capture.sequence_number)?;
+                encode_value(out, &self.capture.users)?;
+                self.next = if let Some(streams) = self.capture.streams.take() {
+                    CaptureStep::Streams(streams, StreamsEncoder::default())
+                } else {
+                    encode_value(out, &None::<StreamsSnapshot>)?;
+                    CaptureStep::Tail
+                };
+            }
+            CaptureStep::Streams(streams, encoder) => {
+                if !encoder.encode_next(streams, out)? {
+                    self.next = CaptureStep::Tail;
+                }
+            }
+            // One step: a full change log at the default capacities (81,920
+            // records, 8.6 MB) encodes in about 7 ms.
+            CaptureStep::Tail => {
+                encode_value(out, &self.capture.client_table)?;
+                encode_value(out, &self.capture.change_log)?;
+                encode_value(out, &self.capture.writer_release)?;
+                self.next = CaptureStep::Done;
+            }
+            CaptureStep::Done => {}
+        }
+        Ok(!matches!(self.next, CaptureStep::Done))
+    }
+}
+
+/// Append `value` to `out` as `rmp_serde::to_vec` encodes it.
+pub(crate) fn encode_value<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+) -> Result<(), SnapshotError> {
+    rmp_serde::encode::write(out, value).map_err(SnapshotError::Serialize)
+}
+
+/// Append the msgpack array header that serde writes ahead of `len` elements.
+pub(crate) fn encode_array_len(out: &mut Vec<u8>, len: usize) -> Result<(), SnapshotError> {
+    let len = u32::try_from(len)
+        .map_err(|_| SnapshotError::InvalidState("a snapshot array outgrows msgpack"))?;
+    rmp::encode::write_array_len(out, len)
+        .map_err(|error| SnapshotError::Serialize(error.into()))?;
+    Ok(())
 }
 
 /// The format version stamped in encoded snapshot bytes, read without decoding the
@@ -403,6 +523,48 @@ pub fn peek_format_version(encoded: &[u8]) -> Option<u32> {
     let mut cursor = encoded;
     rmp::decode::read_array_len(&mut cursor).ok()?;
     rmp::decode::read_int(&mut cursor).ok()
+}
+
+/// The sequence number stamped in encoded snapshot bytes, read from the leading
+/// elements without decoding the state sections behind them.
+///
+/// Unlike [`MetadataSnapshot::decode`] this does not validate the state: it
+/// answers which op a file covers, not whether its state restores.
+///
+/// # Errors
+/// [`SnapshotError::UnsupportedFormatVersion`] for a version this build does not
+/// read, since the position of the field depends on the layout, or
+/// [`SnapshotError::Deserialize`] when the leading elements are missing or are not
+/// unsigned integers.
+pub fn peek_sequence_number(encoded: &[u8]) -> Result<u64, SnapshotError> {
+    // `version`, `created_at`, `sequence_number`.
+    const LEADING_FIELDS: u32 = 3;
+
+    let deserialize =
+        |error: rmp::decode::NumValueReadError| SnapshotError::Deserialize(error.into());
+    let mut cursor = encoded;
+    let fields = rmp::decode::read_array_len(&mut cursor)
+        .map_err(|error| SnapshotError::Deserialize(error.into()))?;
+    if fields < LEADING_FIELDS {
+        return Err(SnapshotError::Deserialize(
+            rmp_serde::decode::Error::LengthMismatch(LEADING_FIELDS),
+        ));
+    }
+    let version: u32 = rmp::decode::read_int(&mut cursor).map_err(deserialize)?;
+    ensure_readable_format_version(version)?;
+    let _created_at: u64 = rmp::decode::read_int(&mut cursor).map_err(deserialize)?;
+    rmp::decode::read_int(&mut cursor).map_err(deserialize)
+}
+
+fn ensure_readable_format_version(version: u32) -> Result<(), SnapshotError> {
+    if (MIN_READABLE_SNAPSHOT_FORMAT_VERSION..=SNAPSHOT_FORMAT_VERSION).contains(&version) {
+        Ok(())
+    } else {
+        Err(SnapshotError::UnsupportedFormatVersion {
+            found: version,
+            expected: SNAPSHOT_FORMAT_VERSION,
+        })
+    }
 }
 
 /// Trait for metadata snapshot implementations.
@@ -653,6 +815,23 @@ mod tests {
         assert!(decoded.client_table.is_none());
     }
 
+    /// The checkpoint goldens always hold a streams section, so this pins the
+    /// encoding of a capture without one.
+    #[test]
+    fn given_a_capture_without_state_machines_when_encoding_should_write_the_snapshot_bytes() {
+        const CREATED_AT: u64 = 1_700_000_000_000_000;
+        let mut expected = MetadataSnapshot::new(7);
+        expected.created_at = CREATED_AT;
+        let mut encoder = MetadataCapture::create(&(), 7, CREATED_AT)
+            .unwrap()
+            .into_encoder();
+
+        let mut bytes = Vec::new();
+        while encoder.encode_next(&mut bytes).unwrap() {}
+
+        assert_eq!(bytes, expected.encode().unwrap());
+    }
+
     #[test]
     fn encoded_shape_is_pinned_to_the_format_version() {
         // The gate is only as good as the discipline that bumps it, and nothing else
@@ -838,6 +1017,53 @@ mod tests {
             Some(SNAPSHOT_FORMAT_VERSION),
             "the first array element must be the format version"
         );
+    }
+
+    #[test]
+    fn given_encoded_snapshot_when_peeking_sequence_number_should_read_only_the_leading_fields() {
+        let mut snapshot = MetadataSnapshot::new(u64::from(u32::MAX) + 7);
+        snapshot.created_at = 1_700_000_000_000_000;
+        let encoded = snapshot.encode().unwrap();
+        let decoded = MetadataSnapshot::decode(&encoded).unwrap().sequence_number;
+        assert_eq!(peek_sequence_number(&encoded).unwrap(), decoded);
+
+        let leading_len = (0..=encoded.len())
+            .find(|&len| peek_sequence_number(&encoded[..len]).is_ok())
+            .unwrap();
+        assert!(leading_len < encoded.len(), "the sections must not be read");
+        assert_eq!(
+            peek_sequence_number(&encoded[..leading_len]).unwrap(),
+            decoded
+        );
+        for len in 0..leading_len {
+            assert!(
+                matches!(
+                    peek_sequence_number(&encoded[..len]),
+                    Err(SnapshotError::Deserialize(_))
+                ),
+                "a payload truncated to {len} bytes must not yield a sequence number"
+            );
+        }
+    }
+
+    #[test]
+    fn given_unreadable_layout_when_peeking_sequence_number_should_refuse_it() {
+        let mut foreign = MetadataSnapshot::new(3);
+        foreign.version = SNAPSHOT_FORMAT_VERSION + 1;
+        assert!(matches!(
+            peek_sequence_number(&foreign.encode().unwrap()),
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. })
+                if found == SNAPSHOT_FORMAT_VERSION + 1
+        ));
+
+        // Two elements, then a value that a reader ignoring the length would take
+        // for the sequence number.
+        let mut short = rmp_serde::to_vec(&(SNAPSHOT_FORMAT_VERSION, 0u64)).unwrap();
+        short.push(5);
+        assert!(matches!(
+            peek_sequence_number(&short),
+            Err(SnapshotError::Deserialize(_))
+        ));
     }
 
     #[test]

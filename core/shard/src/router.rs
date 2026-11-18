@@ -1871,7 +1871,7 @@ mod tests {
         let mut stream = Stream::default();
         stream.topics.insert(topic);
         let mut streams = StreamsInner::default();
-        streams.items.insert(stream);
+        streams.items.insert(Arc::new(stream));
         let segment_size = IggyByteSize::from(SEGMENT_SIZE_BYTES);
         let config = PartitionsConfig {
             messages_required_to_save: MESSAGES_REQUIRED_TO_SAVE,

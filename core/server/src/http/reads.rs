@@ -1487,7 +1487,7 @@ pub(in crate::http) mod tests {
             ..Default::default()
         };
         let topic_id = stream.topics.insert(topic);
-        let stream_id = inner.items.insert(stream);
+        let stream_id = inner.items.insert(Arc::new(stream));
         let original = super::TopicDurability {
             stream_id,
             topic_id,
@@ -1500,7 +1500,7 @@ pub(in crate::http) mod tests {
         );
         inner
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .unwrap()
             .topics
             .get_mut(topic_id)
@@ -1512,7 +1512,7 @@ pub(in crate::http) mod tests {
         );
         inner
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .unwrap()
             .topics
             .get_mut(topic_id)

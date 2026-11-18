@@ -61,20 +61,23 @@ use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::server_error::ServerError;
 use crate::shell::{
-    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellShard, heartbeat_timings,
 };
 use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::Operation;
+use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_object_store::s3::SharedCredentials;
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
-use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use message_bus::{IggyMessageBus, MessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
+use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
@@ -85,7 +88,7 @@ use shard::{
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -894,6 +897,7 @@ async fn shard_main(
     if shard_id == 0 {
         let notifier = make_metadata_commit_notifier(senders_for_notifier, metrics_for_notifier);
         shard.plane.metadata().set_commit_notifier(Some(notifier));
+        install_checkpoint_spawner(&shard);
     } else {
         drop(senders_for_notifier);
         drop(metrics_for_notifier);
@@ -1327,6 +1331,35 @@ fn make_metadata_commit_notifier(
             }
         }
     })
+}
+
+/// Run the metadata checkpoint jobs of `shard` as detached tasks on its bus, so
+/// the commit path that starts one never waits for its snapshot write. Shard 0
+/// only, the sole metadata writer.
+///
+/// The spawner lives inside the shard's metadata, so it holds the shard weakly.
+/// A job that finds the shard gone is dropped with the metadata it would fence.
+pub fn install_checkpoint_spawner<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>)
+where
+    B: MessageBus + Clone + 'static,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let weak_shard = Rc::downgrade(shard);
+    let bus = shard.bus.clone();
+    shard
+        .plane
+        .metadata()
+        .set_checkpoint_spawner(Some(Rc::new(move |job| {
+            let weak_shard = Weak::clone(&weak_shard);
+            bus.spawn(async move {
+                if let Some(shard) = weak_shard.upgrade() {
+                    shard.plane.metadata().run_checkpoint_job(job).await;
+                }
+            });
+        })));
 }
 
 /// Filter at the broadcast site, keeping unrelated ops off the SDK reply

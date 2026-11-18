@@ -963,10 +963,10 @@ key_file = "core/certs/iggy_key.pem"
 # Metadata consensus plane tunables (shard 0's VSR replica: users,
 # streams, topics, sessions). Size these together: a deeper prepare queue
 # admits more concurrent in-flight metadata ops (e.g. login storms), and
-# the journal must hold enough slots that a forced checkpoint (triggered
-# when remaining slots fall to the checkpoint margin, which itself is
-# max(64, prepare_queue_depth)) stays rare. Validation enforces
-# journal_slots >= 4 * max(64, prepare_queue_depth).
+# the journal must hold enough slots that a background checkpoint, started
+# once half of them committed, ends before the remaining slots fall to the
+# checkpoint margin, max(64, prepare_queue_depth), where appends wait for it.
+# Validation enforces journal_slots >= 4 * max(64, prepare_queue_depth).
 [metadata]
 # Depth of the metadata prepare queue: how many uncommitted metadata ops
 # may be in flight at once. Submits beyond it are rejected with the
@@ -977,12 +977,14 @@ key_file = "core/certs/iggy_key.pem"
 prepare_queue_depth = 32
 
 # Size of the metadata WAL's in-memory index, in slots (one committed but
-# not-yet-snapshotted op per slot). Larger values buy more headroom
-# between forced checkpoints at the cost of memory and bigger WAL
-# rewrites per checkpoint. Reducing this for an existing data directory is
-# refused at boot if the live WAL suffix collides in the smaller index;
-# restore the previous value to recover.
-journal_slots = 1024
+# not-yet-snapshotted op per slot). A background checkpoint starts once half
+# of them committed past the last one; the checkpoint margin is the fallback.
+# Larger values buy rarer checkpoints and more time for each, at the cost of
+# index memory (one prepare header per slot) and a longer replay at boot.
+# Reducing this for an existing data directory is refused at boot if the live
+# WAL suffix collides in the smaller index; restore the previous value to
+# recover.
+journal_slots = 65536
 
 # Initial capacity of the metadata session registry, shared by binary clients
 # and HTTP sessions. Live and unretired sessions occupy slots. A full registry

@@ -7519,7 +7519,14 @@ where
             if !planes.0.persist_superblock_if_needed(consensus).await {
                 return;
             }
-            if let Err(error) = journal.append(msg).await {
+            // A WAL rewrite or checkpoint trim running under the append would drop
+            // it from the rewritten file. Released before the reconcile below, which
+            // takes the gate itself.
+            let appended = {
+                let _journal_writes = planes.0.hold_journal_writes().await;
+                journal.append(msg).await
+            };
+            if let Err(error) = appended {
                 tracing::warn!(
                     shard = self.id,
                     op = header.op,
