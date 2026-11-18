@@ -3422,6 +3422,7 @@ fn owner_in_cluster(
         routes,
         PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus.clone()),
         None,
+        true,
         ShardMetrics::for_shard(),
     )
     .expect("valid owner inbox wiring");

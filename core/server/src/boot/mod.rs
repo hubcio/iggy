@@ -82,6 +82,7 @@ use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use shard::shards_table::PartitionShards;
 use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
@@ -365,8 +366,13 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
-    check_repair_ring_share(&config.partition, total_shards)?;
-    check_wal_reload_share(&config.partition, total_shards)?;
+    let owning_shards = PartitionShards::new(
+        total_shards,
+        config.cluster.coordinator.skip_shard_zero_for_partitions,
+    )
+    .owner_count();
+    check_repair_ring_share(&config.partition, owning_shards)?;
+    check_wal_reload_share(&config.partition, owning_shards)?;
     let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
         usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
             ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
@@ -1258,14 +1264,17 @@ async fn shard_main(
 /// and dropped (the periodic tick recovers). Installed via
 /// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
 /// sole writer of the metadata state machine.
-/// Every shard sheds its repair rings against an equal share of the node
-/// budget, so the shard count decides what the budget is worth.
-fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.journal_memory_shard_bytes_max(total_shards);
+/// Every shard that owns partitions sheds its repair rings against an equal
+/// share of the node budget, so their count decides what the budget is worth.
+fn check_repair_ring_share(
+    config: &PartitionConfig,
+    owning_shards: u16,
+) -> Result<(), ServerError> {
+    let share = config.journal_memory_shard_bytes_max(owning_shards);
     let ring = config.evicted_ring_bytes_max.as_bytes_u64();
     if share == 0 {
         error!(
-            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {owning_shards} partition shards",
             config.journal_memory_node_bytes_max
         );
         return Err(ServerError::Config(
@@ -1274,12 +1283,12 @@ fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Resul
     }
     if share < ring {
         warn!(
-            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
+            "each of {owning_shards} partition shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
              less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
         );
     } else {
         info!(
-            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max"
+            "each of {owning_shards} partition shards gets {share} bytes of partition.journal_memory_node_bytes_max"
         );
     }
     Ok(())
@@ -1287,11 +1296,11 @@ fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Resul
 
 /// A share of nothing queues a checkpoint for every op, so the node refuses
 /// to start with it.
-fn check_wal_reload_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.wal_reload_shard_bytes_max(total_shards);
+fn check_wal_reload_share(config: &PartitionConfig, owning_shards: u16) -> Result<(), ServerError> {
+    let share = config.wal_reload_shard_bytes_max(owning_shards);
     if share == 0 {
         error!(
-            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {owning_shards} partition shards",
             config.wal_reload_node_bytes_max
         );
         return Err(ServerError::Config(
@@ -1299,7 +1308,7 @@ fn check_wal_reload_share(config: &PartitionConfig, total_shards: u16) -> Result
         ));
     }
     info!(
-        "each of {total_shards} shards gets {share} bytes of partition.wal_reload_node_bytes_max"
+        "each of {owning_shards} partition shards gets {share} bytes of partition.wal_reload_node_bytes_max"
     );
     Ok(())
 }

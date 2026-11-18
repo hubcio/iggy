@@ -29,7 +29,6 @@
 //! the node refuses every probe so that no primary comes back to it.
 
 use crate::commit_batch;
-use crate::shards_table::calculate_shard_assignment;
 use crate::{
     IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, ShardsTable,
     dispatch_partition_journal_actions, dispatch_partition_wire_actions,
@@ -1491,7 +1490,7 @@ where
         let namespace = IggyNamespace::from_raw(raw);
         self.shards_table
             .shard_for(namespace)
-            .unwrap_or_else(|| calculate_shard_assignment(&namespace, self.shard_count))
+            .unwrap_or_else(|| self.partition_shards.shard_for(&namespace))
     }
 
     fn send_local_rebalance(&self, shard: u16, frame: LocalRebalance) {

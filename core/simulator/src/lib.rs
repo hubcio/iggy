@@ -60,7 +60,7 @@ use seeds::SimSeeds;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP, PartitionLocation, ShardId};
 use shard::commit_batch;
-use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::shards_table::ShardsTable;
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -146,15 +146,11 @@ pub struct SimReplica {
 }
 
 impl SimReplica {
-    /// The shard owning `namespace`'s partition data, by the same
-    /// deterministic hash the router uses.
-    ///
-    /// # Panics
-    /// If the shard count does not fit `u32`; mesh construction caps it at `u16`.
+    /// The shard owning `namespace`'s partition data, by the placement the
+    /// router uses.
     #[must_use]
     pub fn partition_shard(&self, namespace: IggyNamespace) -> &Rc<Replica> {
-        let shard_count = u32::try_from(self.shards.len()).expect("shard count fits u32");
-        let owner = calculate_shard_assignment(&namespace, shard_count);
+        let owner = self.shards[0].partition_shards().shard_for(&namespace);
         &self.shards[usize::from(owner)]
     }
 }
@@ -2168,8 +2164,7 @@ fn materialise_partition(
     namespace: IggyNamespace,
     consumer_offsets_max: usize,
 ) -> bool {
-    let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
-    let owner = calculate_shard_assignment(&namespace, shard_count);
+    let owner = replica.shards[0].partition_shards().shard_for(&namespace);
     let streams = replica.shards[0].plane.metadata().mux_stm.streams();
     // Materialization and recovery must never create metadata. Seeding a vacant
     // slab here changes future allocation and makes replicas diverge after deletion.
@@ -3354,7 +3349,7 @@ mod tests {
         complete_metadata_op(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
         let (namespace, deleted) = incarnation(&sim);
         assert_ne!(
-            calculate_shard_assignment(&namespace, u32::from(SHARDS_PER_REPLICA)),
+            sim.replicas[0].partition_shard(namespace).id,
             0,
             "the partition must live off shard 0"
         );
@@ -10191,7 +10186,8 @@ mod tests {
     /// and the view changes behind it are all timer work.
     fn idle_failover_run(seed: u64, every_partition: bool) -> (u64, Vec<GroupState>, u64) {
         const GROUPS: usize = 6;
-        const SHARDS_PER_REPLICA: u16 = 2;
+        // Partitions skip shard 0, so 3 shards give two that own groups.
+        const SHARDS_PER_REPLICA: u16 = 3;
         let replica_count: u8 = 3;
         let mut sim = Simulator::with_shards(
             usize::from(replica_count),
@@ -10227,21 +10223,35 @@ mod tests {
 
     /// [`idle_failover_run`] for groups that took traffic, and with replica 0
     /// back at the end: it restarts with the log of one partition wiped. Its
-    /// other partition catches up from its own log, the wiped one by a state
-    /// transfer, both on groups that no client writes to.
+    /// other partition catches up from its own log, the wiped one by a repair
+    /// from the primary, both on groups that no client writes to.
+    ///
+    /// The wiped group is one that replica 0 never moved past view 0, so it
+    /// has no recorded view and boots fresh. With a recorded view it would
+    /// wait for a state transfer, which in-memory storage does not model, and
+    /// the primary rebalance decides which group has one.
     fn idle_recovery_run(seed: u64, every_partition: bool) -> (u64, Vec<GroupState>, u64) {
         const REPLICAS: u8 = 3;
+        // Partitions skip shard 0, so 3 shards give two that own groups.
+        const SHARDS_PER_REPLICA: u16 = 3;
         let namespaces = [IggyNamespace::new(1, 1, 0), IggyNamespace::new(1, 1, 1)];
-        let (mut sim, _) = workload_run(seed, 2, every_partition);
+        let (mut sim, _) = workload_run(seed, SHARDS_PER_REPLICA, every_partition);
         let schedule = consensus::HeartbeatSchedule::default();
         for _ in 0..2 * schedule.busy_timeout_ticks {
             sim.step();
         }
+        let wiped = namespaces
+            .into_iter()
+            .find(|namespace| {
+                sim.partition_consensus_state(0, *namespace)
+                    .is_some_and(|state| state.view == 0)
+            })
+            .expect("replica 0 holds one group at view 0");
         sim.replica_crash(0);
         for _ in 0..2 * schedule.idle_timeout_ticks {
             sim.step();
         }
-        sim.replica_restart_losing_partitions(0, &namespaces[1..]);
+        sim.replica_restart_losing_partitions(0, &[wiped]);
         for _ in 0..4 * schedule.idle_timeout_ticks {
             sim.step();
         }
@@ -10249,9 +10259,8 @@ mod tests {
         (sim.schedule_hash(), states, partition_tick_visits(&sim))
     }
 
-    /// The restarted replica needs a repair, a state transfer and the views
-    /// that it missed, and only timers and the frames behind them drive an
-    /// idle group there.
+    /// The restarted replica needs a repair and the views that it missed, and
+    /// only timers and the frames behind them drive an idle group there.
     #[test]
     fn given_idle_groups_that_recover_a_replica_when_ticks_visit_every_partition_should_match_ticks_that_skip_sleepers()
      {

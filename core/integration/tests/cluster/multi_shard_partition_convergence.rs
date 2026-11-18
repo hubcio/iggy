@@ -27,12 +27,13 @@
 //! (`serves_committed_incarnation`), answering anything it cannot yet serve
 //! with a retriable status the SDK replays.
 //!
-//! Forcing two shards is the point. Existing coverage of these fences is
-//! single-shard, where the shard that admits the request is also the one that
-//! owns the partition, so the cross-core path never runs: the hash fallback in
-//! `router::route_typed`, the frame crossing into a peer's inbox, and that
-//! peer's park queue draining on its own pump. Roughly half of the topics below
-//! hash to a shard other than the one homing the connection.
+//! Forcing more than one partition shard is the point. Existing coverage of
+//! these fences is single-shard, where the shard that admits the request is
+//! also the one that owns the partition, so the cross-core path never runs: the
+//! hash fallback in `router::route_typed`, the frame crossing into a peer's
+//! inbox, and that peer's park queue draining on its own pump. Shard 0 hosts no
+//! partition, so the topics below split between shards 1 and 2, and at least
+//! half of them hash to a shard other than the one homing the connection.
 //!
 //! That split is a murmur3 outcome and is invisible from here -- this test would
 //! stay green while silently degrading to single-shard if the hash or the shard
@@ -54,8 +55,8 @@ use integration::iggy_harness;
 
 const STREAM: &str = "convergence-stream";
 const PARTITION_ID: u32 = 0;
-/// Enough topics that the murmur3 assignment lands on both shards; every one is
-/// asserted, so which side each falls on does not matter.
+/// Enough topics that the murmur3 assignment lands on both partition shards;
+/// every one is asserted, so which side each falls on does not matter.
 const TOPICS: u32 = 8;
 
 fn topic_name(index: u32) -> String {
@@ -141,8 +142,8 @@ fn assert_no_degraded_park_paths(harness: &TestHarness) {
 
 /// Topics are created in a batch first, so several materialisations are in
 /// flight at once when the produces start.
-#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "2"))]
-async fn given_two_shards_when_producing_right_after_create_topic_should_round_trip(
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "3"))]
+async fn given_three_shards_when_producing_right_after_create_topic_should_round_trip(
     harness: &TestHarness,
 ) {
     let client = harness.new_client().await.unwrap();

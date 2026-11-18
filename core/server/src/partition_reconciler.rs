@@ -69,7 +69,7 @@
 //! The race is closed at the **owning shard**, not by the routing table:
 //!
 //! - `router::route_typed` treats a missing row as "not seeded yet", not
-//!   "unroutable", and falls back to `calculate_shard_assignment`. The frame
+//!   "unroutable", and falls back to `PartitionShards::shard_for`. The frame
 //!   always reaches the shard that will own the partition.
 //! - `IggyShard::park_if_unmaterialised` holds it there until the matching
 //!   `InsertOwned` lands, then hands it back to the pump -- but not to a
@@ -217,7 +217,7 @@ use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
-use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::shards_table::{PartitionShards, ShardsTable};
 use shard::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -309,7 +309,7 @@ enum Convergence {
 
 pub struct ReconcilerCtx {
     pub shard: Rc<ServerShard>,
-    pub total_shards: u16,
+    pub partition_shards: PartitionShards,
     pub config: Rc<ServerConfig>,
     pub cluster_id: u128,
     pub self_replica_id: u8,
@@ -365,9 +365,13 @@ impl ReconcilerCtx {
             .mux_stm
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
+        let partition_shards = PartitionShards::new(
+            total_shards,
+            config.cluster.coordinator.skip_shard_zero_for_partitions,
+        );
         Self {
             shard,
-            total_shards,
+            partition_shards,
             config,
             cluster_id,
             self_replica_id,
@@ -529,7 +533,7 @@ pub async fn run_reconciler(
 ) {
     debug!(
         shard = ctx.shard.id,
-        total_shards = ctx.total_shards,
+        total_shards = ctx.partition_shards.count(),
         periodic_ms = periodic.as_millis(),
         "partition reconciler starting"
     );
@@ -1048,7 +1052,7 @@ async fn reconcile_target(
         return Convergence::Converged;
     }
 
-    let owning_shard = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    let owning_shard = ctx.partition_shards.shard_for(&ns);
     if owning_shard != shard_id {
         // Compare the epoch, not just presence: a delete + recreate
         // recycles the slab keys, so the row survives with the DEAD
@@ -1314,14 +1318,13 @@ fn reconcile_parked_frames(ctx: &ReconcilerCtx, round_ended: bool, counters: &mu
         return;
     }
     let partitions = ctx.shard.plane.partitions();
-    let total_shards = u32::from(ctx.total_shards);
     for ns in parked {
         if ctx.shard.has_staged_insert_owned(ns) {
             continue;
         }
         // Tombstoned namespaces are still in the map, so `contains` below reads
         // them as materialised.
-        let not_ours = calculate_shard_assignment(&ns, total_shards) != ctx.shard.id;
+        let not_ours = ctx.partition_shards.shard_for(&ns) != ctx.shard.id;
         let tombstoned = partitions.is_tombstoned(&ns);
         if tombstoned || not_ours {
             debug!(
@@ -1420,7 +1423,7 @@ async fn tear_down_owned_partition(
     // upgrade), refuse the delete and surface the inconsistency instead of
     // panicking the pump; the partition stays addressable via its existing
     // local entry until an operator resolves the conflict.
-    let hash_owner = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    let hash_owner = ctx.partition_shards.shard_for(&ns);
     if hash_owner != shard_id {
         ctx.shard.metrics().record_partition_reconcile_failure();
         error!(
@@ -2526,7 +2529,7 @@ mod tests {
     use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
     use server_common::{Message, MessageBag, SegmentStorage};
-    use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
+    use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
     use std::collections::{BTreeSet, HashSet};
@@ -4023,6 +4026,10 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let total_shards: u16 = 4;
+        let placement = PartitionShards::new(
+            total_shards,
+            config.cluster.coordinator.skip_shard_zero_for_partitions,
+        );
 
         // Pick a partition count where the murmur3 distribution lands
         // entries on at least two distinct shards out of four, then
@@ -4034,9 +4041,7 @@ mod tests {
         let mut counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
         for partition_id in 0..partition_count {
             let ns = IggyNamespace::new(0, 0, partition_id as usize);
-            *counts
-                .entry(calculate_shard_assignment(&ns, u32::from(total_shards)))
-                .or_insert(0) += 1;
+            *counts.entry(placement.shard_for(&ns)).or_insert(0) += 1;
         }
         let (shard_id, _) = counts
             .iter()
@@ -4066,7 +4071,7 @@ mod tests {
         let mut routed_only = 0usize;
         for partition_id in 0..partition_count {
             let ns = IggyNamespace::new(0, 0, partition_id as usize);
-            let expected_owner = calculate_shard_assignment(&ns, u32::from(total_shards));
+            let expected_owner = placement.shard_for(&ns);
             if expected_owner == shard_id {
                 assert!(
                     partitions.contains(&ns),
@@ -5024,7 +5029,9 @@ mod tests {
         const DRAIN_PASSES: usize = 16;
         for seed in 0..SEEDS {
             let tmp = TempDir::new().unwrap();
-            let config = test_config(&tmp);
+            let mut config = test_config(&tmp);
+            // Shard 0 must own some of the partitions.
+            config.cluster.coordinator.skip_shard_zero_for_partitions = false;
             let mux = TestMux::default();
             seed_stream(&mux, 1, "oracle-stream");
             let shard = build_test_shard(0, &config, mux);
@@ -5096,7 +5103,9 @@ mod tests {
         const TOTAL_SHARDS: u16 = 2;
         const PARTITIONS: u32 = 8;
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let mut config = test_config(&tmp);
+        // Shard 0 must own some of the partitions.
+        config.cluster.coordinator.skip_shard_zero_for_partitions = false;
         let mux = TestMux::default();
         seed_stream(&mux, 1, "ghost-stream");
         seed_topic(
@@ -5115,7 +5124,7 @@ mod tests {
             .collect();
         let owners: BTreeSet<_> = namespaces
             .iter()
-            .map(|ns| calculate_shard_assignment(ns, u32::from(TOTAL_SHARDS)))
+            .map(|ns| ctx.partition_shards.shard_for(ns))
             .collect();
         assert_eq!(owners.len(), 2, "the topic must straddle both shards");
 
@@ -9139,19 +9148,28 @@ mod tests {
     /// cross-core path, which only happens for namespaces the connection's shard
     /// does not own. That property is a murmur3 outcome, invisible from the
     /// integration test itself: it would stay green while silently degrading to
-    /// single-shard if the hash or the shard count changed. Pin it here, where
-    /// the assignment is a pure function, over the namespaces that test creates
-    /// (stream 0, topics 0..8, partition 0 - the slab keys the STM hands out).
+    /// single-shard if the hash, the shard count or the partition placement
+    /// changed. Pin it here, where the assignment is a pure function, over the
+    /// namespaces that test creates on its three shards with the default
+    /// placement (stream 0, topics 0..8, partition 0 - the slab keys the STM
+    /// hands out).
     #[test]
     fn integration_topic_set_straddles_both_shards() {
-        let owners: Vec<u16> = (0..8)
-            .map(|topic_id| calculate_shard_assignment(&IggyNamespace::new(0, topic_id, 0), 2))
+        let placement = PartitionShards::new(
+            3,
+            ServerConfig::default()
+                .cluster
+                .coordinator
+                .skip_shard_zero_for_partitions,
+        );
+        let owners: BTreeSet<u16> = (0..8)
+            .map(|topic_id| placement.shard_for(&IggyNamespace::new(0, topic_id, 0)))
             .collect();
-        let on_shard_one = owners.iter().filter(|owner| **owner == 1).count();
-        assert!(
-            on_shard_one > 0 && on_shard_one < owners.len(),
-            "the integration test's topics must land on both shards, else it \
-             silently stops covering the cross-core path; got {owners:?}"
+        assert_eq!(
+            owners,
+            BTreeSet::from([1, 2]),
+            "the integration test's topics must land on both partition shards, \
+             else it silently stops covering the cross-core path"
         );
     }
 

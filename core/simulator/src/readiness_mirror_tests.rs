@@ -30,7 +30,6 @@ use iggy_binary_protocol::responses::messages::fetch_messages::FetchMessagesResp
 use iggy_binary_protocol::{Operation, ReplyHeader, RoutedRequestHeader, WirePollingStrategy};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
-use shard::shards_table::calculate_shard_assignment;
 
 use crate::Simulator;
 use crate::client::SimClient;
@@ -41,7 +40,8 @@ const CLIENT: u128 = 1;
 const PRIMARY: u8 = 0;
 const REPLICAS: u8 = 3;
 const SEED: u64 = 0x4D49_5252;
-const SHARDS: u16 = 2;
+/// Shard 0 hosts no partition, so two more shards own the two partitions.
+const SHARDS: u16 = 3;
 const ROUNDS: u64 = 8;
 const REPLY_STEPS: usize = 400;
 const FETCH_COUNT: u32 = 16;
@@ -89,7 +89,7 @@ fn given_records_on_partitions_of_two_shards_when_fetched_each_round_should_retu
     }
 }
 
-/// Three replicas with two shards each, and the first two partitions of one topic
+/// Three replicas with three shards each, and the first two partitions of one topic
 /// that different shards own.
 fn cluster() -> (Simulator, SimClient, [IggyNamespace; 2]) {
     server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
@@ -110,8 +110,8 @@ fn cluster() -> (Simulator, SimClient, [IggyNamespace; 2]) {
         network,
     );
     let first = IggyNamespace::new(0, 0, 0);
-    let owner =
-        |namespace: &IggyNamespace| calculate_shard_assignment(namespace, u32::from(SHARDS));
+    let placement = sim.replicas[0].shards[0].partition_shards();
+    let owner = |namespace: &IggyNamespace| placement.shard_for(namespace);
     let second = (1..PARTITION_CANDIDATES)
         .map(|partition| IggyNamespace::new(0, 0, partition))
         .find(|namespace| owner(namespace) != owner(&first))

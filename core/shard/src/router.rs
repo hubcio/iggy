@@ -17,9 +17,7 @@
 
 use crate::commit_batch;
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
-use crate::shards_table::{
-    ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
-};
+use crate::shards_table::ShardsTable;
 use crate::{
     IggyShard, LifecycleFrame, PARTITION_WALKS_PER_TICK_MAX, Receiver, RestorableMetadataStm,
     ShardFrame,
@@ -209,8 +207,8 @@ where
     }
 
     /// The shard that owns every group of `entries`, or `None` when they span
-    /// shards. Nodes with equal shard counts hash a group to the same shard, so
-    /// a batch between them has one owner.
+    /// shards. Nodes with equal shard counts and partition placement hash a
+    /// group to the same shard, so a batch between them has one owner.
     fn single_target<E>(&self, entries: &[E], group: impl Fn(&E) -> u64) -> Option<u16> {
         let (first, rest) = entries.split_first()?;
         let target = self.group_shard(group(first));
@@ -238,7 +236,7 @@ where
         if group == METADATA_GROUP {
             0
         } else {
-            calculate_shard_from_consensus_ns(group, self.shard_count)
+            self.partition_shards.shard_for_consensus_ns(group)
         }
     }
 
@@ -265,16 +263,16 @@ where
     }
 
     /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
-    /// `StartView`, `Commit`) by hashing its raw `u64` consensus namespace.
-    /// Every node uses the same hash so the shard owning the consensus
-    /// group is deterministic across the cluster.
+    /// `StartView`, `Commit`) by hashing its raw `u64` consensus namespace
+    /// with this node's partition placement, the one the group's partition
+    /// lives under.
     pub(crate) fn route_consensus_control(
         &self,
         message: MessageBag,
         namespace_u64: u64,
         operation: Operation,
     ) {
-        let target = calculate_shard_from_consensus_ns(namespace_u64, self.shard_count);
+        let target = self.partition_shards.shard_for_consensus_ns(namespace_u64);
         self.try_send_to_target(target, message, operation);
     }
 
@@ -301,7 +299,7 @@ where
             let partition_namespace = IggyNamespace::from_raw(namespace_u64);
             // The shards table is a cache of the deterministic hash
             // assignment (every `InsertOwned`/`InsertRouted` row stores
-            // `calculate_shard_assignment`'s result), seeded asynchronously
+            // `PartitionShards::shard_for`'s result), seeded asynchronously
             // by each shard's reconciler. A miss therefore means "not seeded
             // yet", not "unroutable": fall back to the hash so frames arriving
             // during the post-commit convergence window still reach the shard
@@ -321,7 +319,7 @@ where
                         partition = partition_namespace.partition_id(),
                         "namespace not in shards_table; routing by hash assignment"
                     );
-                    calculate_shard_assignment(&partition_namespace, self.shard_count)
+                    self.partition_shards.shard_for(&partition_namespace)
                 });
             self.try_send_to_target(target, generic, operation);
             return;
@@ -1744,12 +1742,11 @@ mod tests {
         let (senders, inboxes, _replies) = shard_mesh_channels(SHARDS, INBOX_CAPACITY, 1);
         shard.attach_senders(senders);
         let inboxes: Vec<_> = inboxes.into_iter().map(Option::unwrap).collect();
+        let placement = shard.partition_shards();
         let groups_on = |target| {
             (0..)
                 .map(|id| IggyNamespace::new(1, 1, id).inner())
-                .filter(move |group| {
-                    calculate_shard_from_consensus_ns(*group, u32::from(SHARDS)) == target
-                })
+                .filter(move |group| placement.shard_for_consensus_ns(*group) == target)
         };
         let on_zero = groups_on(0).next().unwrap();
         let on_one: Vec<u64> = groups_on(1).take(2).collect();
@@ -1913,6 +1910,7 @@ mod tests {
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus),
             None,
+            true,
             ShardMetrics::for_shard(),
         )
         .expect("valid shard wiring");

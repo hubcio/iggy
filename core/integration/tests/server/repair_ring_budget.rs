@@ -16,8 +16,9 @@
 // under the License.
 
 //! The repair ring budget of a running server. Boot splits
-//! `partition.journal_memory_node_bytes_max` across the shards, and the tick of
-//! every shard sheds against its share and reports it.
+//! `partition.journal_memory_node_bytes_max` across the shards that own
+//! partitions, and the tick of every shard sheds against that share and
+//! reports it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -56,14 +57,18 @@ async fn given_a_node_ring_budget_when_the_shards_tick_should_report_an_equal_sh
     let deadline = Instant::now() + REPORT_DEADLINE;
     loop {
         let shares = reported_shares(&http).await;
-        let equal_share = NODE_BUDGET_BYTES.checked_div(shares.len() as u64);
+        // `cluster.coordinator.skip_shard_zero_for_partitions` is on by default,
+        // so shard 0 owns no partition once a node has more than one shard.
+        let owning_shards = (shares.len() as u64).saturating_sub(1).max(1);
+        let equal_share = NODE_BUDGET_BYTES.checked_div(owning_shards);
         if shares.iter().all(|&share| Some(share) == equal_share) && !shares.is_empty() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "within {REPORT_DEADLINE:?} every shard must report an equal share of \
-             {NODE_BUDGET_BYTES} bytes, last shares: {shares:?}"
+            "within {REPORT_DEADLINE:?} every shard must report the share of \
+             {NODE_BUDGET_BYTES} bytes that each partition shard gets, last shares: \
+             {shares:?}"
         );
         sleep(POLL_INTERVAL).await;
     }

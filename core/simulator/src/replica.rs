@@ -548,6 +548,7 @@ pub fn new_shard(
                 clock,
             ),
             None,
+            config.cluster.coordinator.skip_shard_zero_for_partitions,
             shard::metrics::ShardMetrics::for_shard(),
         )
         .expect("sim mesh senders are built in canonical order"),

@@ -11250,6 +11250,7 @@ mod tests {
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            true,
             ShardMetrics::for_shard(),
         )
         .expect("valid shard wiring");

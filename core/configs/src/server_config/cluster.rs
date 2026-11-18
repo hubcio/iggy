@@ -413,6 +413,15 @@ pub struct ClusterCoordinatorConfig {
     /// shard-0 parallelism more than replicas do.
     #[serde(default)]
     pub skip_shard_zero_for_clients: bool,
+    /// When `total_shards > 1`, place no partition on shard 0, so a stall of
+    /// the metadata plane there cannot stop the heartbeats of partition
+    /// groups. With two shards every partition lands on shard 1. Placement is
+    /// recomputed at every boot and no shard id is stored, so a restart may
+    /// change this freely. Run the same value on every node: a node that
+    /// differs still routes correctly, but frames between it and its peers
+    /// can take an extra hop between shards, as with differing shard counts.
+    #[serde(default = "default_skip_shard_zero_for_partitions")]
+    pub skip_shard_zero_for_partitions: bool,
 }
 
 fn default_skip_shard_zero_for_replicas() -> bool {
@@ -423,12 +432,17 @@ fn default_replica_connections_per_peer() -> u16 {
     1
 }
 
+fn default_skip_shard_zero_for_partitions() -> bool {
+    true
+}
+
 impl Default for ClusterCoordinatorConfig {
     fn default() -> Self {
         Self {
             skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
             replica_connections_per_peer: default_replica_connections_per_peer(),
             skip_shard_zero_for_clients: false,
+            skip_shard_zero_for_partitions: default_skip_shard_zero_for_partitions(),
         }
     }
 }

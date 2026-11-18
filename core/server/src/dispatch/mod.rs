@@ -2780,6 +2780,7 @@ mod tests {
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            true,
             ShardMetrics::for_shard(),
         )
         .expect("single-sender ring is canonically ordered");

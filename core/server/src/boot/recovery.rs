@@ -48,7 +48,7 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
 use shard::metrics::ShardMetrics;
-use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
+use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
 use shard::{
     CoordinatorConfig, PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame,
     ShardIdentity, TaggedSender,
@@ -148,14 +148,18 @@ pub(in crate::boot) async fn build_shard_for_thread(
             .sum::<usize>()
     });
 
+    let partition_shards = PartitionShards::new(
+        total_shards,
+        config.cluster.coordinator.skip_shard_zero_for_partitions,
+    );
     // IggyPartitions holds only the partitions owned by this shard
     // (see the filter below at insert time), so the server-wide total
-    // is an N-fold overshoot. `ceil(total / shards) * 2` is a coarse
+    // is an N-fold overshoot. `ceil(total / owning shards) * 2` is a coarse
     // upper bound that absorbs hash skew without paying the full
     // multiplier. PapayaShardsTable below stays sized to the server-wide
     // total because every shard routes every namespace.
     let owned_partitions_capacity = total_partitions
-        .div_ceil(usize::from(total_shards).max(1))
+        .div_ceil(usize::from(partition_shards.owner_count()))
         .saturating_mul(2);
     // Each encrypted stream holds its own key, wrapped under the server key.
     // The shards owning its partitions open it below, shard 0 opens the keys of
@@ -196,7 +200,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         usize::try_from(
             config
                 .partition
-                .journal_memory_shard_bytes_max(total_shards),
+                .journal_memory_shard_bytes_max(partition_shards.owner_count()),
         )
         .unwrap_or(usize::MAX),
     )))
@@ -204,7 +208,11 @@ pub(in crate::boot) async fn build_shard_for_thread(
         config.partition.checkpoint_idle_delay.get_duration(),
         config.partition.checkpoint_max_delay.get_duration(),
     ))
-    .with_wal_reload_budget(config.partition.wal_reload_shard_bytes_max(total_shards));
+    .with_wal_reload_budget(
+        config
+            .partition
+            .wal_reload_shard_bytes_max(partition_shards.owner_count()),
+    );
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by
@@ -230,8 +238,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                         continue;
                     }
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
-                    let owning_shard =
-                        calculate_shard_assignment(&namespace, u32::from(total_shards));
+                    let owning_shard = partition_shards.shard_for(&namespace);
                     if owning_shard == shard_id {
                         // Shared per-partition stats from the registry: the
                         // same `Arc` backs every shard's `get_topic` reply.
@@ -381,6 +388,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         CoordinatorConfig {
             skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
         },
+        partition_shards.skip_shard_zero(),
         metrics,
     )
     .with_partition_io_limits(super::threads::partition_io_limits(&config.sharding)?)

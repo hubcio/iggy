@@ -105,7 +105,7 @@ use server_common::sharding::{
     IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, PartitionLocation, ShardId,
 };
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
-use shards_table::ShardsTable;
+use shards_table::{PartitionShards, ShardsTable};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -1987,10 +1987,9 @@ where
     /// therefore index by `target_shard` without re-checking.
     senders: Vec<TaggedSender>,
 
-    /// Total shard count, cached from `senders.len()` at construction.
-    /// `senders` is immutable post-ctor, so consensus routing reads this
-    /// rather than recomputing the `usize -> u32` conversion per frame.
-    shard_count: u32,
+    /// Shard count, from `senders.len()` at construction, and the partition
+    /// placement over it.
+    partition_shards: PartitionShards,
 
     /// Receiver end of this shard's inbox.  Peer shards (and self) send
     /// messages here via the corresponding sender.
@@ -2342,6 +2341,8 @@ where
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
     ///   the coordinator is injected at construction time so an
     ///   `IggyShard` cannot appear half-wired to a reader.
+    /// * `skip_shard_zero_for_partitions` - keep partitions off shard 0, see
+    ///   [`PartitionShards`].
     /// * `metrics` - per-shard observability handle; currently the
     ///   `frame_drops_total` counter.
     ///
@@ -2374,11 +2375,12 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
+        skip_shard_zero_for_partitions: bool,
         metrics: crate::metrics::ShardMetrics,
     ) -> Result<Self, ShardCtorError> {
         validate_sender_ordering(&senders)?;
         let shard_count =
-            u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
+            u16::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
@@ -2404,7 +2406,7 @@ where
             on_client_request: host::client_request_handler(&host),
             host,
             senders,
-            shard_count,
+            partition_shards: PartitionShards::new(shard_count, skip_shard_zero_for_partitions),
             inbox,
             reply_inbox,
             poll_completions,
@@ -2704,7 +2706,7 @@ where
         mut gathered: Gathered,
         mut fold: impl FnMut(&mut Gathered, Reply),
     ) -> (Gathered, bool) {
-        let shard_count = self.shard_count as usize;
+        let shard_count = usize::from(self.partition_shards.count());
         let (reply_tx, reply_rx) = channel::<Reply>(shard_count.max(1));
         let mut expected = 0usize;
         for sender in &self.senders {
@@ -2939,9 +2941,8 @@ where
         read: PartitionRead,
     ) -> Result<(u16, Receiver<PartitionReadReply>), IggyError> {
         let target = self.shards_table.shard_for(namespace).or_else(|| {
-            matches!(read, PartitionRead::SessionsRetired { .. }).then(|| {
-                crate::shards_table::calculate_shard_assignment(&namespace, self.shard_count)
-            })
+            matches!(read, PartitionRead::SessionsRetired { .. })
+                .then(|| self.partition_shards.shard_for(&namespace))
         });
         let Some(target) = target else {
             tracing::warn!(
@@ -3212,10 +3213,7 @@ where
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
-            crate::shards_table::calculate_shard_from_consensus_ns(
-                namespace.inner(),
-                self.shard_count,
-            )
+            self.partition_shards.shard_for(&namespace)
         });
         let (reply_tx, reply_rx) = channel::<Option<Message<GenericHeader>>>(1);
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
@@ -3348,7 +3346,7 @@ where
         const POLL_COMPLETION_CAPACITY: usize = 1;
 
         // Placeholder lanes: the simulator delivers frames straight to
-        // `on_message` (see the `shard_count` note below), so nothing ever
+        // `on_message` (see the `partition_shards` note below), so nothing ever
         // sends here and capacity 1 exists only to satisfy the fields. The
         // real lanes are bounded on purpose (`inbox_capacity` /
         // `reply_inbox_capacity` are the shard's backpressure), so no
@@ -3374,11 +3372,11 @@ where
             senders: Vec::new(),
             // The simulator delivers inbound messages straight to
             // `on_message`, bypassing the inter-shard router. The router's
-            // `shard_count` should therefore never be read on this path,
-            // but `pub fn dispatch` is still reachable; pinning to 1 keeps
-            // `% shard_count` from panicking if a future caller slips
-            // through, while preserving single-shard routing semantics.
-            shard_count: 1,
+            // placement should therefore never be read on this path,
+            // but `pub fn dispatch` is still reachable; pinning one shard
+            // keeps the placement from dividing by zero if a future caller
+            // slips through, while preserving single-shard routing semantics.
+            partition_shards: PartitionShards::new(1, false),
             inbox,
             reply_inbox,
             deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
@@ -3464,6 +3462,11 @@ where
     }
 
     #[must_use]
+    pub const fn partition_shards(&self) -> PartitionShards {
+        self.partition_shards
+    }
+
+    #[must_use]
     pub const fn metrics(&self) -> &crate::metrics::ShardMetrics {
         &self.metrics
     }
@@ -3479,8 +3482,8 @@ where
     ///
     /// Whole mesh, not one sender: consumers index by shard id and
     /// `forward_metadata_submit` indexes `senders[0]` unconditionally, so a
-    /// one-element vec is correct only for shard 0. `shard_count` tracks it, as
-    /// in both constructors.
+    /// one-element vec is correct only for shard 0. `partition_shards` counts it,
+    /// as in both constructors.
     ///
     /// # Panics
     /// If the mesh is not ordered `senders[i].shard_id() == i` or does not cover
@@ -3494,7 +3497,9 @@ where
             self.id
         );
         validate_sender_ordering(&senders).expect("attach_senders: mesh must be ordered by shard");
-        self.shard_count = u32::try_from(senders.len()).expect("shard count fits u32");
+        let count = u16::try_from(senders.len()).expect("shard count fits u16");
+        self.partition_shards =
+            PartitionShards::new(count, self.partition_shards.skip_shard_zero());
         self.senders = senders;
     }
 

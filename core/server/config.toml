@@ -710,6 +710,15 @@ replica_connections_per_peer = 1
 # from shard-0 parallelism more than replicas do.
 skip_shard_zero_for_clients = false
 
+# When the server runs more than one shard, place no partition on shard 0, so
+# a stall of the metadata plane there cannot stop the heartbeats of partition
+# groups. With two shards every partition lands on shard 1. Placement is
+# recomputed at every boot and no shard id is stored, so a restart may change
+# this freely. Run the same value on every node: a node that differs still
+# routes correctly, but frames between it and its peers can take an extra hop
+# between shards, as with differing shard counts.
+skip_shard_zero_for_partitions = true
+
 # Full roster of cluster members. Byte-identical on every node. The running
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current
@@ -1210,8 +1219,10 @@ evicted_ring_bytes_max = "64 MiB"
 # their buffers, about 4 KiB each. A buffer counts for its whole allocation,
 # which is a multiple of 4 KiB, so a small op costs far more here than its
 # length. The count leaves out the map overhead of the rings, so it is a
-# lower bound. Each shard gets an equal share, because a shard can shed only
-# its own partitions. Must be > 0, and the share must be at least 1 byte.
+# lower bound. Each shard that owns partitions gets an equal share, because a
+# shard can shed only its own partitions. With
+# cluster.coordinator.skip_shard_zero_for_partitions, shard 0 owns none. Must
+# be > 0, and the share must be at least 1 byte.
 # Past its share, a shard sheds in three steps on each tick:
 # 1. The rings that grew earliest release batches to their segments, until
 #    the shard is one eighth under the share.
@@ -1250,9 +1261,9 @@ checkpoint_max_delay = "5 min"
 
 # Node-wide cap on the partition WAL bytes above the checkpoints. A boot loads
 # these bytes into memory again, so this bounds what a restart reloads. Each
-# shard gets an equal share. Past its share, a shard queues checkpoints for
-# the partitions whose first op since their checkpoint is oldest, until the
-# queued bytes cover the excess. The queue paces these checkpoints like the
+# shard that owns partitions gets an equal share. Past its share, a shard
+# queues checkpoints for the partitions whose first op since their checkpoint
+# is oldest, until the queued bytes cover the excess. The queue paces these checkpoints like the
 # others. A boot reloads at most the share plus what the partitions write
 # while they wait in the queue. Must be > 0, and the share must be at least
 # 1 byte. partition_wal_reload_bytes reports the bytes of a shard,
