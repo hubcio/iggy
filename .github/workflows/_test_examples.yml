@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(inputs.matrix) }}
-    runs-on: ubuntu-26.04
+    runs-on: gcp-ubuntu-26-04
     timeout-minutes: 60
     steps:
       - name: Checkout code

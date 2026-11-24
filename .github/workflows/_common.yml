@@ -31,7 +31,7 @@ permissions:
 jobs:
   rust-versions:
     name: Rust versions sync
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -41,7 +41,7 @@ jobs:
 
   python-versions:
     name: Python SDK versions sync
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -51,7 +51,7 @@ jobs:
 
   python-interpreter-versions:
     name: Python interpreter versions sync
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -61,7 +61,7 @@ jobs:
 
   python-lockfiles:
     name: Python lockfiles
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -74,7 +74,7 @@ jobs:
 
   version-consistency:
     name: Version consistency
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -94,7 +94,7 @@ jobs:
 
   edge-image-catalog:
     name: Edge image catalog
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -114,7 +114,7 @@ jobs:
 
   license-headers:
     name: License headers
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -134,7 +134,7 @@ jobs:
   third-party-licenses:
     name: Validate third-party licenses
     if: inputs.validate-third-party-licenses
-    runs-on: ubuntu-26.04
+    runs-on: gcp-ubuntu-26-04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
@@ -142,7 +142,7 @@ jobs:
 
   markdown:
     name: Markdown lint
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -165,7 +165,7 @@ jobs:
 
   shellcheck:
     name: Shell scripts lint
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -182,7 +182,7 @@ jobs:
 
   trailing-whitespace:
     name: Trailing whitespace
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -195,7 +195,7 @@ jobs:
 
   trailing-newline:
     name: Trailing newline
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -208,7 +208,7 @@ jobs:
 
   toml-format:
     name: TOML formatting
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -232,7 +232,7 @@ jobs:
 
   binary-artifacts:
     name: Binary artifacts
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -245,7 +245,7 @@ jobs:
 
   typos:
     name: Typos
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     env:
       FORCE_COLOR: 1
@@ -278,7 +278,7 @@ jobs:
         typos,
       ]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Summary

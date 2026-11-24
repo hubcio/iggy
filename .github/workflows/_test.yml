@@ -44,7 +44,7 @@ jobs:
     # Select runner based on build target
     runs-on: ${{
       matrix.task == 'build-macos' && 'macos-15' ||
-      'ubuntu-26.04'
+      'gcp-ubuntu-26-04'
       }}
     timeout-minutes: 60
     steps:
