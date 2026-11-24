@@ -77,7 +77,7 @@ permissions:
 
 jobs:
   detect:
-    runs-on: ubuntu-slim
+    runs-on: gcp-ubuntu-slim
     timeout-minutes: 10
     outputs:
       runtime: ${{ steps.mk.outputs.runtime }}
